@@ -1,0 +1,10 @@
+version: "3"
+services:
+  exchange-scraper:
+    image: exchange-scraper
+    build: .
+    restart: unless-stopped
+    container_name: exchange-scraper
+    volumes:
+      - .:/app
+

@@ -1,0 +1,7 @@
+beautifulsoup4
+python-rapidjson
+requests
+selenium
+urllib3
+webdriver-manager
+tqdm

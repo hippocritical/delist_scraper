@@ -1,0 +1,12 @@
+[
+    {   
+        "config_path": "global_blacklist.json",
+        "ips": ["127.0.0.1:8080"],
+        "username": "my_super_secret_username",
+        "password": "my_super_secret_password",
+        "exchanges": ["binance", "kucoin"],
+        "force_exit_long": false,
+        "force_enter_short": false,
+    },
+]
+
