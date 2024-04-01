@@ -34,7 +34,7 @@ class StatVars:
     bot_groups = []
     datetimeFormat = '%Y-%m-%dT%H:%M:%S%z'
 
-    loop_secs = 0
+    loop_secs = 30
 
     logging.basicConfig(
         level=logging.INFO,
