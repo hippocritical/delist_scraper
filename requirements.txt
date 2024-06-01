@@ -5,3 +5,5 @@ selenium
 urllib3
 webdriver-manager
 tqdm
+ccxt
+freqtrade_client
