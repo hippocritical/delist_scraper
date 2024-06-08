@@ -6,7 +6,7 @@ import re
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import ccxt
@@ -225,9 +225,7 @@ class BinanceScraper:
                     .replace(".", " ")
                     .replace("(", " ")
                     .replace(")", " ")
-                    .replace("/", " ")
                     .replace("$", " ")
-                    .replace("https://".upper(), " https://".upper())
                     .strip()
                     )
 
@@ -237,13 +235,14 @@ class BinanceScraper:
             my_title = my_title.replace("  ", " ")
 
         set_title = set(my_title.strip().split(" "))
+        set_title_no_trailing_slash = [word.split('/')[0] for word in set_title]
 
         # prepare variables
         all_coins = {pair['id'].upper().replace("-", "") for pair in self.pairs.values()}
         all_coins.update({pair['base'].upper() for pair in self.pairs.values()})
 
         # Use list comprehension to build the set of coins directly
-        set_coins = {coin for coin in set_title if coin.upper() in all_coins}
+        set_coins = {coin for coin in set_title_no_trailing_slash if coin.upper() in all_coins}
 
         if len(set_coins) == 0:
             # report any news that did not contain a pair to be blacklisted
@@ -284,7 +283,7 @@ class BinanceScraper:
         message_dict = {
             "exchange": self.exchange,
             "date": msg_datetime.strftime(StatVars.datetimeFormat),
-            "date_scraped": datetime.utcnow().strftime(StatVars.datetimeFormat),
+            "date_scraped": datetime.now(timezone.utc).strftime(StatVars.datetimeFormat),
             "message": message_content,
             "linked_urls": urls,
             # to be filled in read_message, not to be saved into the bots file
@@ -612,25 +611,30 @@ def send_blacklists():
         if 'new_pair_blacklist' in bot_group:
             for ip in bot_group['ips']:
                 try:
-
                     api_bot = (
-                        freqtrade_client.FtRestClient(f"http://{ip}", bot_group['username'], bot_group['password']))
-                    blacklist_response = api_bot.blacklist()
-                    if blacklist_response is None:
-                        logging.warning(f"bot http://{ip} did not respond while trying to send the blacklist! "
-                                        f"Skipping")
-                        continue
-                    for pair in bot_group['new_pair_blacklist']:
-                        if pair in blacklist_response['blacklist']:
-                            logging.info(f"bot http://{ip}: Skipped sending the blacklist pair  {pair}"
-                                         f"Reason: pair exists already")
-                        else:
-                            result = api_bot.blacklist(pair)
-                            if 'error' in result:
-                                logging.error(f"bot http://{ip}: Attempted to send a blacklist pair and failed"
-                                              f"Error: {result['result']}")
+                        freqtrade_client.FtRestClient(
+                            f"http://{ip}", bot_group['username'], bot_group['password']))
+                    api_bot_status = api_bot.status()
+                    if isinstance(api_bot_status, list):
+                        blacklist_response = api_bot.blacklist()
+                        if blacklist_response is None:
+                            logging.warning(f"bot http://{ip} did not respond while trying to send the blacklist! "
+                                            f"Skipping")
+                            continue
+                        for pair in bot_group['new_pair_blacklist']:
+                            if pair in blacklist_response['blacklist']:
+                                logging.info(f"bot http://{ip}: Skipped sending the blacklist pair  {pair}"
+                                             f"Reason: pair exists already")
                             else:
-                                logging.info(f"bot http://{ip}: Successfully sent the pair {pair} to the blacklist")
+                                result = api_bot.blacklist(pair)
+                                if 'error' in result:
+                                    logging.error(f"bot http://{ip}: Attempted to send a blacklist pair and failed"
+                                                  f"Error: {result['result']}")
+                                else:
+                                    logging.info(f"bot http://{ip}: Successfully sent the pair {pair} to the blacklist")
+                    else:
+                        logging.warning(f"bot http://{ip}: connection failed. Skipping to send send_blacklists!")
+
                 except Exception as ex:
                     logging.error(f"An error occurred: {ex}")
 
@@ -641,15 +645,20 @@ def send_force_enter_short():
             if 'new_pair_blacklist' in bot_group:
                 for ip in bot_group['ips']:
                     api_bot = (
-                        freqtrade_client.FtRestClient(f"http://{ip}", bot_group['username'], bot_group['password']))
-                    for pair in bot_group['new_pair_blacklist']:
-                        result = api_bot.forceenter(pair, 'short')
-                        if 'error' in result:
-                            logging.error(f"bot http://{ip}: Attempted to force enter a short trade of {pair}"
-                                          f" and failed. Error: {result['result']}")
-                        else:
-                            logging.info(f"bot http://{ip}: Successfully sent a force enter short order "
-                                         f"of the pair {pair}")
+                        freqtrade_client.FtRestClient(
+                            f"http://{ip}", bot_group['username'], bot_group['password']))
+                    api_bot_status = api_bot.status()
+                    if isinstance(api_bot_status, list):
+                        for pair in bot_group['new_pair_blacklist']:
+                            result = api_bot.forceenter(pair, 'short')
+                            if 'error' in result:
+                                logging.error(f"bot http://{ip}: Attempted to force enter a short trade of {pair}"
+                                              f" and failed. Error: {result['result']}")
+                            else:
+                                logging.info(f"bot http://{ip}: Successfully sent a force enter short order "
+                                             f"of the pair {pair}")
+                    else:
+                        logging.warning(f"bot http://{ip}: connection failed. Skipping to send send_force_enter_short!")
 
 
 def send_force_exit_long():
@@ -658,19 +667,23 @@ def send_force_exit_long():
             if 'new_pair_blacklist' in bot_group:
                 for ip in bot_group['ips']:
                     api_bot = (
-                        freqtrade_client.FtRestClient(f"http://{ip}", bot_group['username'], bot_group['password']))
+                        freqtrade_client.FtRestClient(
+                            f"http://{ip}", bot_group['username'], bot_group['password']))
                     open_trades = api_bot.status()
-                    for pair in bot_group['new_pair_blacklist']:
-                        for open_trade in open_trades:
-                            if pair == open_trade['pair']:
-                                if not open_trade['is_short']:  # only exit long, not short
-                                    result = api_bot.forceexit(open_trade['trade_id'])
-                                    if 'error' in result:
-                                        logging.error(f"bot http://{ip}: Attempted to force exit a long trade of {pair}"
-                                                      f" and failed. Error: {result['result']}")
-                                    else:
-                                        logging.info(f"bot http://{ip}: Successfully sent a force-exit-long order "
-                                                     f"of the pair {pair}")
+                    if isinstance(open_trades, list):
+                        for pair in bot_group['new_pair_blacklist']:
+                            for open_trade in open_trades:
+                                if pair == open_trade['pair']:
+                                    if not open_trade['is_short']:  # only exit long, not short
+                                        result = api_bot.forceexit(open_trade['trade_id'])
+                                        if 'error' in result:
+                                            logging.error(f"bot http://{ip}: Attempted to force exit a long trade "
+                                                          f"of {pair} and failed. Error: {result['result']}")
+                                        else:
+                                            logging.info(f"bot http://{ip}: Successfully sent a force-exit-long order "
+                                                         f"of the pair {pair}")
+                    else:
+                        logging.warning(f"bot http://{ip}: connection failed. Skipping to send_force_exit_long!")
 
 
 # This checks all bots' connections ... just for the user as a sanity check
@@ -678,12 +691,13 @@ def check_all_bots():
     logging.info("checking all bot-connections:")
     for bot_group in StatVars.bot_groups:
         for ip in bot_group['ips']:
-            api_bot = (freqtrade_client.FtRestClient(f"http://{ip}", bot_group['username'], bot_group['password']))
+            api_bot = (freqtrade_client.FtRestClient(
+                f"http://{ip}", bot_group['username'], bot_group['password']))
             response = api_bot.status()
             if isinstance(response, list):
-                logging.info(f"connection to bot http://{ip}: connection successful!")
+                logging.info(f"bot http://{ip}: connection successful!")
             else:
-                logging.warning(f"connection to bot http://{ip}: connection failed?!")
+                logging.warning(f"bot http://{ip}: connection failed?!")
 
 
 def reset_static_variables():
@@ -729,11 +743,11 @@ def main():
     exchanges = ['binance', 'kucoin', 'bybit', 'okx', 'gateio', 'htx']
     exchanges_pairs = {exchange: {} for exchange in exchanges}  # Initialize as empty dictionaries
 
+    # Create the WebDriver instance
+    StatVars.driver = webdriver.Chrome(options=StatVars.options)
+
     while True:
         try:
-            # Create the WebDriver instance
-            StatVars.driver = webdriver.Chrome(options=StatVars.options)
-
             StatVars.blacklist_changed = False
 
             # Only rescan if the minute is not modulo 5 == 0
@@ -791,6 +805,8 @@ def main():
             time.sleep(StatVars.loop_secs - ((time.monotonic() - start_time) % StatVars.loop_secs))
         except Exception as ex:
             logging.error(f"An error occurred: {ex}")
+            StatVars.driver.quit()
+            StatVars.driver = webdriver.Chrome(options=StatVars.options)
 
 
 if __name__ == "__main__":
