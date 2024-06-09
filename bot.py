@@ -36,7 +36,7 @@ class StatVars:
     bot_groups = []
     datetimeFormat = '%Y-%m-%dT%H:%M:%S%z'
 
-    loop_secs = 10
+    loop_secs = 30
 
     logging.basicConfig(
         level=logging.INFO,
@@ -169,7 +169,8 @@ class BinanceScraper:
             StatVars.logger.warning(f"{self.exchange}: we didn't find any messages!? "
                                     f"Aborting for this loop... "
                                     f"(if this doesnt happen multiple times in a row then you can ignore this message)")
-            return messages, len_messages, True  # we didn't find any messages, well let s just exit...
+            raise ValueError(f"No messages found for {self.exchange}")
+            #return messages, len_messages, True  # we didn't find any messages, well let s just exit...
 
         message_dict = self.prepare_message_dict(messages[0])
         message_dict_without_date_scraped = copy.deepcopy(message_dict)
@@ -806,6 +807,7 @@ def main():
         except Exception as ex:
             logging.error(f"An error occurred: {ex}")
             StatVars.driver.quit()
+            time.sleep(60)  # an error happened, could be anything ... even being rate limited ... Take a nap bot!
             StatVars.driver = webdriver.Chrome(options=StatVars.options)
 
 
