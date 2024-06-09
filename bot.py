@@ -166,10 +166,9 @@ class BinanceScraper:
 
         len_messages = len(messages)
         if len_messages == 0:
-            StatVars.logger.warning(f"{self.exchange}: we didn't find any messages!? "
-                                    f"Aborting for this loop... "
-                                    f"(if this doesnt happen multiple times in a row then you can ignore this message)")
-            raise ValueError(f"No messages found for {self.exchange}")
+            raise ValueError(f"{self.exchange}: we didn't find any messages!? "
+                             f"Aborting for this loop... "
+                             f"(if this doesnt happen multiple times in a row then you can ignore this message)")
             #return messages, len_messages, True  # we didn't find any messages, well let s just exit...
 
         message_dict = self.prepare_message_dict(messages[0])
