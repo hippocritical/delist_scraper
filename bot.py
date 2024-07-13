@@ -8,6 +8,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+import fnmatch
 
 import ccxt
 import freqtrade_client
@@ -203,9 +204,10 @@ class BinanceScraper:
         unique_identifier = (message_dict.get("exchange"), message_dict.get("date"))
 
         if unique_identifier in StatVars.unique_identifiers:
-            StatVars.logger.info(
-                f"{self.exchange}: We found a message that has already been scraped. "
-                f"Stopping to get additional news!")
+            if not first_try:
+                StatVars.logger.info(
+                    f"{self.exchange}: We found a message that has already been scraped. "
+                    f"Stopping to get additional news!")
             stop_loop = True
         elif len_messages == prev_message_count:
             StatVars.logger.info(f"{self.exchange}: We found {prev_message_count} messages overall! "
@@ -243,10 +245,8 @@ class BinanceScraper:
 
         return message_dict
 
-    # currently there is an exception for single character coins since
-    # they would otherwise block too much with all those prefixes available like 1000 100000 ...
-    # An improvement could be to have a list of prefixes and suffixes that are available
-    # on an exchange and to add those specifically instead of doing a general prefix wildcard.
+    # This was changed to specifically looking for prefixes since a pair W and T was blacklisted, which would
+    # blacklist all pairs ending on a T or W which ... sucks
     def get_blacklisted_coins(self, title: str):
         my_title = (title.upper()
                     .replace("and".upper(), " ")
@@ -279,16 +279,30 @@ class BinanceScraper:
             logging.info(f"did not find any of those strings: {my_title}, "
                          f"maybe it wasn't a coin but a currency or it s not a coin that was on the exchange directly")
 
-        # now we add wildcards before and after the coin itself since we assume the ban is exchange wide
-        coins_with_wildcards = []
-        for coin in set_coins:
-            if len(coin) == 1:
-                # see the description at the top of this function.
-                coins_with_wildcards.append(f"{coin}/.*")
-            else:
-                coins_with_wildcards.append(f".*{coin}/.*")
+        caught_coins = set()
+        for set_coin in set_coins:
+            # Add the coin itself without any prefix or suffix
+            pattern_coin_itself = f"{set_coin}/.*"
+            caught_coins.add(pattern_coin_itself)
 
-        return coins_with_wildcards
+            # Check all combinations of prefixes and suffixes
+            for prefix in self.coin_prefixes:
+                for suffix in self.coin_suffixes:
+                    # Construct potential coin combinations
+                    potential_coin_combo = f"{prefix}{set_coin}{suffix}".upper()
+                    potential_coin_prefix = f"{prefix}{set_coin}".upper()
+                    potential_coin_suffix = f"{set_coin}{suffix}".upper()
+
+                    # Check if any of these patterns match 'base' values in self.pairs
+                    for pair_key, pair_value in self.pairs.items():
+                        if 'base' in pair_value:
+                            base_value = pair_value['base'].upper()
+                            if (fnmatch.fnmatch(base_value, potential_coin_combo) or
+                                    fnmatch.fnmatch(base_value, potential_coin_prefix) or
+                                    fnmatch.fnmatch(base_value, potential_coin_suffix)):
+                                caught_coins.add(base_value)
+
+        return caught_coins
 
     def prepare_message_dict(self, message_html):
         message_text_elements = []
