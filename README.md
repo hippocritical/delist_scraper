@@ -76,7 +76,7 @@ nano bot-groups.json
 ## Non-docker
 ```
 bash install.sh
-bash install_chrome.sh
+bash install_firefox.sh
 source .venv/bin/activate
 bash run.sh
 ```

@@ -13,15 +13,13 @@ import ccxt
 import freqtrade_client
 import rapidjson
 from bs4 import BeautifulSoup
-from selenium import webdriver
-from selenium.webdriver.chrome.options import Options
 from tqdm import tqdm
+
+from selenium import webdriver
+from selenium.webdriver.firefox.service import Service as FirefoxService
 
 
 class StatVars:
-    # Tries to scroll up multiple times to make the parsing of the data less often and thereby speed up drastically.
-    driver = None
-
     # Please don't set it to 0 !
     scrollUpSleepTime = 0.5
 
@@ -30,13 +28,14 @@ class StatVars:
     CONFIG_PARSE_MODE = rapidjson.PM_COMMENTS | rapidjson.PM_TRAILING_COMMAS
 
     has_been_processed = []
-    has_been_processed_without_date_scraped = []
+    unique_identifiers = []
+
     to_be_processed = []
 
     bot_groups = []
     datetimeFormat = '%Y-%m-%dT%H:%M:%S%z'
 
-    loop_secs = 30
+    loop_secs = 10
 
     logging.basicConfig(
         level=logging.INFO,
@@ -44,18 +43,36 @@ class StatVars:
     )
     logger = logging.getLogger(__name__)
 
-    options = Options()
-    options.add_argument("--headless")
-    options.add_argument("--no-sandbox")
-    options.add_argument("--disable-dev-shm-usage")
-    options.add_argument("--remote-debugging-pipe")
-    options.add_argument("--accept-lang=en")
+    driver = None
 
-    # Disable loading images
-    prefs = {"profile.managed_default_content_settings.images": 2}
-    options.add_experimental_option("prefs", prefs)
 
-    # driver_subUrl = webdriver.Chrome(options=options)
+def set_driver():
+    try:
+        # Set up Firefox options
+        options = webdriver.FirefoxOptions()
+        options.binary_location = "/usr/bin/firefox"  # Ensure this is the correct path to Firefox
+        options.add_argument("--headless")
+        options.add_argument("--no-sandbox")
+        options.add_argument("--disable-dev-shm-usage")
+        options.set_preference("intl.accept_languages", "en")
+        options.set_preference("permissions.default.image", 2)  # Disable loading images
+
+        # Specify the path to the manually installed geckodriver
+        geckodriver_path = "/usr/local/bin/geckodriver"
+        service = FirefoxService(executable_path=geckodriver_path)
+
+        # Initialize Firefox WebDriver with the specified options and service
+        logging.info("Initializing Firefox WebDriver")
+        driver = webdriver.Firefox(service=service, options=options)
+        # Set timeouts
+        driver.set_page_load_timeout(600)  # Set the page load timeout to 600 seconds (10 minutes)
+        driver.implicitly_wait(600)  # Set the implicit wait timeout to 600 seconds (10 minutes)
+
+        logging.info("Firefox WebDriver initialized successfully")
+        return driver
+    except Exception as e:
+        logging.error(f"Failed to initialize WebDriver: {e}")
+        return None
 
 
 def report_to_be_processed():
@@ -86,8 +103,22 @@ def get_exchange_pairs(exchange_name):
             print(f"Error fetching markets for {exchange_name}: {e}. Retrying after {sleep_timer_on_error}s ...")
 
 
+def get_unique_identifier(message_dict):
+    unique_identifier = (message_dict.get("exchange"), message_dict.get("date"))
+    return unique_identifier
+
+
+def set_unique_identifiers():
+    StatVars.unique_identifiers = set(
+        (entry["exchange"], entry["date"]) for entry in StatVars.has_been_processed
+    )
+    pass
+
+
 class BinanceScraper:
     exchange = "binance"
+    coin_prefixes = ["000"]
+    coin_suffixes = ["DOWN", "UP", "BEAR", "BULL"]
 
     url = "https://t.me/s/binance_announcements"
 
@@ -125,12 +156,10 @@ class BinanceScraper:
         for message_html in messages[::-1]:
             prepared_message_dict = self.prepare_message_dict(message_html)
             message_dict = self.read_message(prepared_message_dict)
-            message_dict_without_date_scraped = copy.deepcopy(message_dict)
-            message_dict_without_date_scraped.pop("date_scraped", None)
 
             if message_dict['message'] == "":
                 continue
-            elif message_dict_without_date_scraped in StatVars.has_been_processed_without_date_scraped:
+            elif get_unique_identifier(message_dict) in StatVars.unique_identifiers:
                 # logging.info(f"message already exists for exchange {message_dict['exchange']}: "
                 #              f"{message_dict['message']}")
                 break
@@ -169,24 +198,21 @@ class BinanceScraper:
             raise ValueError(f"{self.exchange}: we didn't find any messages!? "
                              f"Aborting for this loop... "
                              f"(if this doesnt happen multiple times in a row then you can ignore this message)")
-            #return messages, len_messages, True  # we didn't find any messages, well let s just exit...
 
         message_dict = self.prepare_message_dict(messages[0])
-        message_dict_without_date_scraped = copy.deepcopy(message_dict)
-        message_dict_without_date_scraped.pop("date_scraped", None)
+        unique_identifier = (message_dict.get("exchange"), message_dict.get("date"))
 
-        if message_dict_without_date_scraped in StatVars.has_been_processed_without_date_scraped:
-            if not first_try:
-                StatVars.logger.info(
-                    f"{self.exchange}: We found a message that has already been scraped. "
-                    f"Stopping to get additional news!")
+        if unique_identifier in StatVars.unique_identifiers:
+            StatVars.logger.info(
+                f"{self.exchange}: We found a message that has already been scraped. "
+                f"Stopping to get additional news!")
             stop_loop = True
         elif len_messages == prev_message_count:
             StatVars.logger.info(f"{self.exchange}: We found {prev_message_count} messages overall! "
-                                 f"The count didn't increase. "
-                                 f"Stopping...")
+                                 f"The count didn't increase. Stopping...")
             stop_loop = True
         elif self.initialScrollUpTimes == 0:
+            stop_loop = True
             pass
         else:
             StatVars.logger.info(
@@ -217,6 +243,10 @@ class BinanceScraper:
 
         return message_dict
 
+    # currently there is an exception for single character coins since
+    # they would otherwise block too much with all those prefixes available like 1000 100000 ...
+    # An improvement could be to have a list of prefixes and suffixes that are available
+    # on an exchange and to add those specifically instead of doing a general prefix wildcard.
     def get_blacklisted_coins(self, title: str):
         my_title = (title.upper()
                     .replace("and".upper(), " ")
@@ -252,7 +282,11 @@ class BinanceScraper:
         # now we add wildcards before and after the coin itself since we assume the ban is exchange wide
         coins_with_wildcards = []
         for coin in set_coins:
-            coins_with_wildcards.append(f".*{coin}/.*")
+            if len(coin) == 1:
+                # see the description at the top of this function.
+                coins_with_wildcards.append(f"{coin}/.*")
+            else:
+                coins_with_wildcards.append(f".*{coin}/.*")
 
         return coins_with_wildcards
 
@@ -307,6 +341,8 @@ class KucoinScraper(BinanceScraper):
 
     exchange = "kucoin"
     url = "https://t.me/s/Kucoin_News"
+    coin_prefixes = ["000"]
+    coin_suffixes = ["2L", "2S", "3L", "3S", "DOWN", "UP"]
 
     def read_message(self, message_dict):
         if message_dict is None:
@@ -338,7 +374,8 @@ class KucoinScraper(BinanceScraper):
             # If another website is stated here, then skip it. In the end we don't want to risk false positives
             if "https://www.kucoin.com/announcement" not in url:
                 continue
-            own_driver = webdriver.Chrome(options=StatVars.options)
+            own_driver = set_driver()
+
             own_driver.get(url.split('#')[0])
             html_source = own_driver.page_source
             soup = BeautifulSoup(html_source, "html.parser")
@@ -371,6 +408,9 @@ class BybitScraper(BinanceScraper):
     def __init__(self):
         super().__init__()
 
+    coin_prefixes = ["000"]
+    coin_suffixes = ["1000", "3L", "3S"]
+
     exchange = "bybit"
     url = "https://t.me/s/Bybit_Announcements"
 
@@ -400,6 +440,9 @@ class OkxScraper(BinanceScraper):
     def __init__(self):
         super().__init__()
 
+    coin_prefixes = []
+    coin_suffixes = []
+
     exchange = "okx"
     url = "https://t.me/s/OKXAnnouncements"
 
@@ -423,6 +466,9 @@ class GateioScraper(BinanceScraper):
     def __init__(self):
         super().__init__()
 
+    coin_prefixes = []
+    coin_suffixes = ["3L", "3S", "5L", "5S", "TOKEN", "PLATFORM"]
+
     exchange = "gateio"
     url = "https://t.me/s/GateioOfficialNews"
 
@@ -445,6 +491,9 @@ class GateioScraper(BinanceScraper):
 class HtxScraper(BinanceScraper):
     def __init__(self):
         super().__init__()
+
+    coin_prefixes = []
+    coin_suffixes = ["1S", "2L", "2S", "3L", "3S", "2X"]
 
     exchange = "htx"
     url = "https://t.me/s/HTXGlobalAnnouncementChannel"
@@ -540,20 +589,15 @@ def save_blacklist(exchange: str, new_blacklisted_pairs: []):
                 rapidjson.dump(data, json_file, indent=4)
 
 
-def update_has_been_processed_without_date_scraped():
-    StatVars.has_been_processed_without_date_scraped = copy.deepcopy(StatVars.has_been_processed)
-    for msg in StatVars.has_been_processed_without_date_scraped:
-        msg.pop("date_scraped", None)
-
-
 def open_processed():
     StatVars.logger.info("Loading local processed file")
     try:
+        set_unique_identifiers()
         # Read config from stdin if requested in the options
         with Path(StatVars.path_processed_file).open() if StatVars.path_processed_file != '-' else sys.stdin as file:
             StatVars.has_been_processed = rapidjson.load(file, parse_mode=StatVars.CONFIG_PARSE_MODE)
-        update_has_been_processed_without_date_scraped()
-
+        StatVars.unique_identifiers = set(
+            (entry["exchange"], entry["date"]) for entry in StatVars.has_been_processed)
     except FileNotFoundError:
         logging.error(f'Config file "{StatVars.path_processed_file}" not found!'
                       ' Please create a config file or check whether it exists.')
@@ -564,11 +608,12 @@ def open_processed():
 def save_processed():
     StatVars.logger.info("Saving local processed file")
     try:
-        update_has_been_processed_without_date_scraped()
+        set_unique_identifiers()
         sorted_json_obj = rapidjson.dumps(
             sorted(StatVars.has_been_processed, key=lambda x: (x['exchange'], x['date'])), indent=4)
         with open(StatVars.path_processed_file, "w") as outfile:
             outfile.write(sorted_json_obj)
+
     except Exception as e:
         logging.info(e)
 
@@ -579,7 +624,6 @@ def load_blacklist(config_file):
         # Read config from stdin if requested in the options
         with Path(config_file).open() if StatVars.path_processed_file != '-' else sys.stdin as file:
             StatVars.has_been_processed = rapidjson.load(file, parse_mode=StatVars.CONFIG_PARSE_MODE)
-        update_has_been_processed_without_date_scraped()
 
     except FileNotFoundError:
         logging.error(f'Config file "{StatVars.path_processed_file}" not found!'
@@ -725,6 +769,11 @@ def refresh_ccxt_exchange_pairs(exchanges_pairs):
 
 
 def main():
+    # make the script not gobble up resources
+    os.nice(15)
+
+    StatVars.driver = set_driver()
+
     open_processed()
     load_bots_data()
 
@@ -742,9 +791,6 @@ def main():
     heartbeat_time = datetime.min  # will push a heartbeat out instantly
     exchanges = ['binance', 'kucoin', 'bybit', 'okx', 'gateio', 'htx']
     exchanges_pairs = {exchange: {} for exchange in exchanges}  # Initialize as empty dictionaries
-
-    # Create the WebDriver instance
-    StatVars.driver = webdriver.Chrome(options=StatVars.options)
 
     while True:
         try:
@@ -806,8 +852,8 @@ def main():
         except Exception as ex:
             logging.error(f"An error occurred: {ex}")
             StatVars.driver.quit()
-            time.sleep(60)  # an error happened, could be anything ... even being rate limited ... Take a nap bot!
-            StatVars.driver = webdriver.Chrome(options=StatVars.options)
+            time.sleep(30)  # an error happened, could be anything ... even being rate limited ... Take a nap bot!
+            StatVars.driver = set_driver()
 
 
 if __name__ == "__main__":
