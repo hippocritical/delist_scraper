@@ -125,7 +125,7 @@ class BinanceScraper:
 
     url = "https://t.me/s/binance_announcements"
 
-    initialScrollUpTimes = 25
+    initialScrollUpTimes = 200
     initialWaitSeconds = 0
 
     message_bubble = "tgme_widget_message_wrap"
@@ -870,7 +870,7 @@ def main():
             current_exchange = "okx"
             if current_exchange.lower() in exchanges_to_loop_through:
                 current_instance = OkxScraper()
-                del current_instance
+                current_instance.scrape(exchanges_pairs[current_exchange])
         except Exception as ex1:
             handle_exception(ex1)
 
