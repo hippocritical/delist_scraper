@@ -49,7 +49,7 @@ The initial setup takes a lot of memory. It is advised to do the initial round o
 After the initial run you can easily run the scraper on a 1GB VPS with a weak CPU.
 
 ## Note on using ARM processors
-Selenium cannot run on ARM processors, sorry.
+Geckodriver only supports 64bit arm processors via precompiled releases out of the box.
 
 ## Setup Process:
 

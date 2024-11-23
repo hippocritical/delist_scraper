@@ -1,6 +1,7 @@
 import concurrent.futures
-import copy
+import gc
 import logging
+
 import os
 import re
 import sys
@@ -10,11 +11,12 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import fnmatch
 
+from tqdm import tqdm
+from bs4 import BeautifulSoup
+import rapidjson
+
 import ccxt
 import freqtrade_client
-import rapidjson
-from bs4 import BeautifulSoup
-from tqdm import tqdm
 
 from selenium import webdriver
 from selenium.webdriver.firefox.service import Service as FirefoxService
@@ -48,32 +50,32 @@ class StatVars:
 
 
 def set_driver():
-    try:
-        # Set up Firefox options
-        options = webdriver.FirefoxOptions()
-        options.binary_location = "/usr/bin/firefox"  # Ensure this is the correct path to Firefox
-        options.add_argument("--headless")
-        options.add_argument("--no-sandbox")
-        options.add_argument("--disable-dev-shm-usage")
-        options.set_preference("intl.accept_languages", "en")
-        options.set_preference("permissions.default.image", 2)  # Disable loading images
+    logging.info("starting driver for browser")
+    # Set up Firefox options
+    options = webdriver.FirefoxOptions()
+    options.add_argument("--headless")
+    #options.add_argument("--no-sandbox")
+    #options.add_argument("--disable-dev-shm-usage")
+    options.set_preference("intl.accept_languages", "en")
+    options.set_preference("permissions.default.image", 2)  # Disable loading images
+    #options.add_argument("--single-process")
+    options.add_argument("--disable-crash-reporter")
+    options.add_argument("--disable-infobars")
 
-        # Specify the path to the manually installed geckodriver
-        geckodriver_path = "/usr/local/bin/geckodriver"
-        service = FirefoxService(executable_path=geckodriver_path)
+    # Specify the path to the manually installed geckodriver
+    geckodriver_path = "/usr/local/bin/geckodriver"
+    service = FirefoxService(executable_path=geckodriver_path)
 
-        # Initialize Firefox WebDriver with the specified options and service
-        logging.info("Initializing Firefox WebDriver")
-        driver = webdriver.Firefox(service=service, options=options)
-        # Set timeouts
-        driver.set_page_load_timeout(600)  # Set the page load timeout to 600 seconds (10 minutes)
-        driver.implicitly_wait(600)  # Set the implicit wait timeout to 600 seconds (10 minutes)
+    # Initialize Firefox WebDriver with the specified options and service
+    # logging.info("Initializing Firefox WebDriver")
+    driver = webdriver.Firefox(service=service, options=options)
 
-        logging.info("Firefox WebDriver initialized successfully")
-        return driver
-    except Exception as e:
-        logging.error(f"Failed to initialize WebDriver: {e}")
-        return None
+    # Set timeouts
+    driver.set_page_load_timeout(60)  # Set the page load timeout to 60 seconds
+    driver.implicitly_wait(60)  # Set the implicit wait timeout to 60 seconds
+
+    # logging.info("Firefox WebDriver initialized successfully")
+    return driver
 
 
 def report_to_be_processed():
@@ -98,10 +100,10 @@ def get_exchange_pairs(exchange_name):
                 logging.info(f"Refreshing pairs for exchange {exchange}, we found {len(markets)} pairs.")
                 return markets
             else:
-                print(f"No markets available for {exchange_name}. Retrying after {sleep_timer_on_error}s ...")
+                logging.info(f"No markets available for {exchange_name}. Retrying after {sleep_timer_on_error}s ...")
                 time.sleep(sleep_timer_on_error)
         except Exception as e:
-            print(f"Error fetching markets for {exchange_name}: {e}. Retrying after {sleep_timer_on_error}s ...")
+            logging.info(f"Error fetching markets for {exchange_name}: {e}. Retrying after {sleep_timer_on_error}s ...")
 
 
 def get_unique_identifier(message_dict):
@@ -123,7 +125,7 @@ class BinanceScraper:
 
     url = "https://t.me/s/binance_announcements"
 
-    initialScrollUpTimes = 100
+    initialScrollUpTimes = 25
     initialWaitSeconds = 0
 
     message_bubble = "tgme_widget_message_wrap"
@@ -135,6 +137,7 @@ class BinanceScraper:
 
     def scrape(self, pairs):
         self.pairs = pairs
+
         StatVars.driver.get(self.url)
         time.sleep(self.initialWaitSeconds)
 
@@ -146,13 +149,13 @@ class BinanceScraper:
         if self.initialScrollUpTimes > 0:
             while not stop_loop:
                 # scrolling several times to make the overall loop faster, uses tqdm for a progression bar
-                for _ in tqdm(range(current_scroll_up_times), desc="Scrolling up to fetch more news", unit="scroll"):
+                for _ in tqdm(range(current_scroll_up_times), desc=f"Scrolling up to fetch more news for "
+                                                                   f"{self.exchange}", unit="scroll"):
                     StatVars.driver.execute_script("window.scrollTo(0, 0);")
                     time.sleep(StatVars.scrollUpSleepTime)
                     for_loops_count += 1
                 messages, prev_message_count, stop_loop = self.read_messages(StatVars.driver, prev_message_count)
                 # stop_loop = True  # enable for quicker debugging, so it only scrolls for one rotation
-
         # now fill the message_html
         for message_html in messages[::-1]:
             prepared_message_dict = self.prepare_message_dict(message_html)
@@ -186,7 +189,10 @@ class BinanceScraper:
             if for_loops_count == 0:
                 send_force_exit_long()
                 send_force_enter_short()
+
         reset_static_variables()
+
+        # logging.info(f"successfully ran through {self.exchange}.scrape()")
 
     def read_messages(self, read_messages_driver, prev_message_count, first_try=False):
         stop_loop = False
@@ -316,7 +322,7 @@ class BinanceScraper:
         else:
             stripped_message = ""
 
-        # Remove non-printable characters and multiple whitespaces
+        # Remove non-logging.infoable characters and multiple whitespaces
         message_content = re.sub(r'[^\x00-\x7F]+', ' ', stripped_message)
         message_content = re.sub(r'\s+', ' ', message_content)
         message_content = re.sub(r'(?i)(https://)', r' \1', message_content)
@@ -413,7 +419,8 @@ class KucoinScraper(BinanceScraper):
                         if not re.match(r'^\d+\.', txt):  # Paragraph does not start with a number
                             return " ".join(found_messages)
                         found_messages.append(txt)
-
+            own_driver.quit()
+            own_driver = None
         # return a space separated string of those found words
         return ""
 
@@ -486,6 +493,8 @@ class GateioScraper(BinanceScraper):
     exchange = "gateio"
     url = "https://t.me/s/GateioOfficialNews"
 
+
+
     def read_message(self, message_dict):
         if message_dict is None:
             return None
@@ -510,7 +519,7 @@ class HtxScraper(BinanceScraper):
     coin_suffixes = ["1S", "2L", "2S", "3L", "3S", "2X"]
 
     exchange = "htx"
-    url = "https://t.me/s/HTXGlobalAnnouncementChannel"
+    url = "https://t.me/htxglobalofficial"
 
     def read_message(self, message_dict):
         if message_dict is None:
@@ -681,12 +690,12 @@ def send_blacklists():
                             continue
                         for pair in bot_group['new_pair_blacklist']:
                             if pair in blacklist_response['blacklist']:
-                                logging.info(f"bot http://{ip}: Skipped sending the blacklist pair  {pair}"
+                                logging.info(f"bot http://{ip}: Skipped sending the blacklist pair  {pair} "
                                              f"Reason: pair exists already")
                             else:
                                 result = api_bot.blacklist(pair)
                                 if 'error' in result:
-                                    logging.error(f"bot http://{ip}: Attempted to send a blacklist pair and failed"
+                                    logging.error(f"bot http://{ip}: Attempted to send a blacklist pair and failed "
                                                   f"Error: {result['result']}")
                                 else:
                                     logging.info(f"bot http://{ip}: Successfully sent the pair {pair} to the blacklist")
@@ -782,12 +791,23 @@ def refresh_ccxt_exchange_pairs(exchanges_pairs):
             exchanges_pairs[exchange] = future.result()
 
 
+def handle_exception(ex1):
+    try:
+        StatVars.driver.quit()
+    except Exception as ex3:
+        logging.error(f"an error occurred: {ex3}")
+    try:
+        StatVars.driver = set_driver()
+    except Exception as ex2:
+        logging.error(f"an error occurred: {ex2}")
+    logging.error(f"An error occurred: {ex1}")
+    time.sleep(30)  # an error happened, could be anything ... even being rate limited ... Take a nap bot!
+
+
 def main():
+    StatVars.driver = set_driver()
     # make the script not gobble up resources
     os.nice(15)
-
-    StatVars.driver = set_driver()
-
     open_processed()
     load_bots_data()
 
@@ -823,34 +843,66 @@ def main():
                 time.sleep(60)
                 refresh_ccxt_exchange_pairs(exchanges_pairs)
                 heartbeat_time_pairs = datetime.now()
+                StatVars.driver.quit()
+                StatVars.driver = set_driver()
 
             start_time = time.monotonic()
+        except Exception as ex1:
+            handle_exception(ex1)
 
+        try:
             current_exchange = "binance"
             if current_exchange.lower() in exchanges_to_loop_through:
-                BinanceScraper().scrape(exchanges_pairs[current_exchange])
+                current_instance = BinanceScraper()
+                current_instance.scrape(exchanges_pairs[current_exchange])
+        except Exception as ex1:
+            handle_exception(ex1)
 
+        try:
             current_exchange = "bybit"
             if current_exchange.lower() in exchanges_to_loop_through:
-                BybitScraper().scrape(exchanges_pairs[current_exchange])
+                current_instance = BybitScraper()
+                current_instance.scrape(exchanges_pairs[current_exchange])
+        except Exception as ex1:
+            handle_exception(ex1)
 
+        try:
             current_exchange = "okx"
             if current_exchange.lower() in exchanges_to_loop_through:
-                OkxScraper().scrape(exchanges_pairs[current_exchange])
+                current_instance = OkxScraper()
+                del current_instance
+        except Exception as ex1:
+            handle_exception(ex1)
 
+        try:
             current_exchange = "gateio"
             if current_exchange.lower() in exchanges_to_loop_through:
-                GateioScraper().scrape(exchanges_pairs[current_exchange])
+                current_instance = GateioScraper()
+                current_instance.scrape(exchanges_pairs[current_exchange])
+        except Exception as ex1:
+            handle_exception(ex1)
 
+        # HTX stopped working have to change the URL.
+        '''
+        try:
             current_exchange = "htx"
             if current_exchange.lower() in exchanges_to_loop_through:
-                HtxScraper().scrape(exchanges_pairs[current_exchange])
-
+                current_instance = HtxScraper()
+                current_instance.scrape(exchanges_pairs[current_exchange])
+                del current_instance
+        except Exception as ex1:
+            handle_exception(ex1)
+        '''
+        try:
             current_exchange = "kucoin"
             if current_exchange.lower() in exchanges_to_loop_through:
-                KucoinScraper().scrape(exchanges_pairs[current_exchange])
+                current_instance = KucoinScraper()
+                current_instance.scrape(exchanges_pairs[current_exchange])
+        except Exception as ex1:
+            handle_exception(ex1)
 
-            if datetime.now() - heartbeat_time >= timedelta(seconds=60):
+        try:
+            if datetime.now() - heartbeat_time >= timedelta(minutes=15):
                 # Execute heartbeat action
                 logging.info("delist-scraper heartbeat")
 
@@ -863,11 +915,10 @@ def main():
             logging.debug(f"for this loop we still have to wait for {time_to_sleep_left} seconds")
 
             time.sleep(StatVars.loop_secs - ((time.monotonic() - start_time) % StatVars.loop_secs))
-        except Exception as ex:
-            logging.error(f"An error occurred: {ex}")
-            StatVars.driver.quit()
-            time.sleep(30)  # an error happened, could be anything ... even being rate limited ... Take a nap bot!
-            StatVars.driver = set_driver()
+            # logging.info("looped once successfully")
+        except Exception as ex1:
+            handle_exception(ex1)
+        gc.collect()
 
 
 if __name__ == "__main__":
