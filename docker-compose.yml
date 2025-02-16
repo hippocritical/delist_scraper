@@ -1,10 +1,17 @@
-version: "3"
+version: '3.8'
+
 services:
-  exchange-scraper:
-    image: exchange-scraper
+  exchange_scraper:
     build: .
-    restart: unless-stopped
-    container_name: exchange-scraper
     volumes:
       - .:/app
-
+    working_dir: /app
+    command: bash -c "bash install.sh --nosudo && bash install_firefox.sh --nosudo && bash run.sh"
+    environment:
+      - PYTHONUNBUFFERED=1
+    restart: unless-stopped
+  
+  firefox:
+    image: selenium/standalone-firefox
+    shm_size: 10g
+    restart: unless-stopped

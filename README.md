@@ -84,7 +84,7 @@ bash run.sh
 
 ## Docker
 ```
-docker compose up -d --build
+docker compose up --build
 ```
 
 # Frequenthippo - analytics

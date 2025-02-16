@@ -1,9 +1,16 @@
 #!/usr/bin/env bash
 #encoding=utf8
 
+# Check for the --nosudo flag
+if [[ "$1" == "--nosudo" ]]; then
+    SUDO=""
+else
+    SUDO="sudo"
+fi
+
 # Update the repository and install necessary packages
-sudo apt-get update && sudo apt-get upgrade -y
-sudo apt-get install -y python3-venv curl software-properties-common apt-transport-https ca-certificates gnupg2 jq
+$SUDO apt-get update && $SUDO apt-get upgrade -y
+$SUDO apt-get install -y python3-venv curl software-properties-common apt-transport-https ca-certificates gnupg2 jq
 
 # Create a virtual environment and activate it
 rm -rf .venv
