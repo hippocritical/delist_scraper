@@ -1,27 +1,28 @@
 import concurrent.futures
-import copy
+import gc
 import logging
+
 import os
 import re
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+import fnmatch
+
+from tqdm import tqdm
+from bs4 import BeautifulSoup
+import rapidjson
 
 import ccxt
 import freqtrade_client
-import rapidjson
-from bs4 import BeautifulSoup
+
 from selenium import webdriver
-from selenium.webdriver.chrome.options import Options
-from tqdm import tqdm
+from selenium.webdriver.firefox.service import Service as FirefoxService
 
 
 class StatVars:
-    # Tries to scroll up multiple times to make the parsing of the data less often and thereby speed up drastically.
-    driver = None
-
     # Please don't set it to 0 !
     scrollUpSleepTime = 0.5
 
@@ -30,7 +31,8 @@ class StatVars:
     CONFIG_PARSE_MODE = rapidjson.PM_COMMENTS | rapidjson.PM_TRAILING_COMMAS
 
     has_been_processed = []
-    has_been_processed_without_date_scraped = []
+    unique_identifiers = []
+
     to_be_processed = []
 
     bot_groups = []
@@ -44,18 +46,36 @@ class StatVars:
     )
     logger = logging.getLogger(__name__)
 
-    options = Options()
+    driver = None
+
+
+def set_driver():
+    logging.info("starting driver for browser")
+    # Set up Firefox options
+    options = webdriver.FirefoxOptions()
     options.add_argument("--headless")
-    options.add_argument("--no-sandbox")
-    options.add_argument("--disable-dev-shm-usage")
-    options.add_argument("--remote-debugging-pipe")
-    options.add_argument("--accept-lang=en")
+    #options.add_argument("--no-sandbox")
+    #options.add_argument("--disable-dev-shm-usage")
+    options.set_preference("intl.accept_languages", "en")
+    options.set_preference("permissions.default.image", 2)  # Disable loading images
+    #options.add_argument("--single-process")
+    options.add_argument("--disable-crash-reporter")
+    options.add_argument("--disable-infobars")
 
-    # Disable loading images
-    prefs = {"profile.managed_default_content_settings.images": 2}
-    options.add_experimental_option("prefs", prefs)
+    # Specify the path to the manually installed geckodriver
+    geckodriver_path = "/usr/local/bin/geckodriver"
+    service = FirefoxService(executable_path=geckodriver_path)
 
-    # driver_subUrl = webdriver.Chrome(options=options)
+    # Initialize Firefox WebDriver with the specified options and service
+    # logging.info("Initializing Firefox WebDriver")
+    driver = webdriver.Firefox(service=service, options=options)
+
+    # Set timeouts
+    driver.set_page_load_timeout(60)  # Set the page load timeout to 60 seconds
+    driver.implicitly_wait(60)  # Set the implicit wait timeout to 60 seconds
+
+    # logging.info("Firefox WebDriver initialized successfully")
+    return driver
 
 
 def report_to_be_processed():
@@ -80,18 +100,32 @@ def get_exchange_pairs(exchange_name):
                 logging.info(f"Refreshing pairs for exchange {exchange}, we found {len(markets)} pairs.")
                 return markets
             else:
-                print(f"No markets available for {exchange_name}. Retrying after {sleep_timer_on_error}s ...")
+                logging.info(f"No markets available for {exchange_name}. Retrying after {sleep_timer_on_error}s ...")
                 time.sleep(sleep_timer_on_error)
         except Exception as e:
-            print(f"Error fetching markets for {exchange_name}: {e}. Retrying after {sleep_timer_on_error}s ...")
+            logging.info(f"Error fetching markets for {exchange_name}: {e}. Retrying after {sleep_timer_on_error}s ...")
+
+
+def get_unique_identifier(message_dict):
+    unique_identifier = (message_dict.get("exchange"), message_dict.get("date"))
+    return unique_identifier
+
+
+def set_unique_identifiers():
+    StatVars.unique_identifiers = set(
+        (entry["exchange"], entry["date"]) for entry in StatVars.has_been_processed
+    )
+    pass
 
 
 class BinanceScraper:
     exchange = "binance"
+    coin_prefixes = ["000"]
+    coin_suffixes = ["DOWN", "UP", "BEAR", "BULL"]
 
     url = "https://t.me/s/binance_announcements"
 
-    initialScrollUpTimes = 100
+    initialScrollUpTimes = 200
     initialWaitSeconds = 0
 
     message_bubble = "tgme_widget_message_wrap"
@@ -103,6 +137,7 @@ class BinanceScraper:
 
     def scrape(self, pairs):
         self.pairs = pairs
+
         StatVars.driver.get(self.url)
         time.sleep(self.initialWaitSeconds)
 
@@ -114,23 +149,21 @@ class BinanceScraper:
         if self.initialScrollUpTimes > 0:
             while not stop_loop:
                 # scrolling several times to make the overall loop faster, uses tqdm for a progression bar
-                for _ in tqdm(range(current_scroll_up_times), desc="Scrolling up to fetch more news", unit="scroll"):
+                for _ in tqdm(range(current_scroll_up_times), desc=f"Scrolling up to fetch more news for "
+                                                                   f"{self.exchange}", unit="scroll"):
                     StatVars.driver.execute_script("window.scrollTo(0, 0);")
                     time.sleep(StatVars.scrollUpSleepTime)
                     for_loops_count += 1
                 messages, prev_message_count, stop_loop = self.read_messages(StatVars.driver, prev_message_count)
                 # stop_loop = True  # enable for quicker debugging, so it only scrolls for one rotation
-
         # now fill the message_html
         for message_html in messages[::-1]:
             prepared_message_dict = self.prepare_message_dict(message_html)
             message_dict = self.read_message(prepared_message_dict)
-            message_dict_without_date_scraped = copy.deepcopy(message_dict)
-            message_dict_without_date_scraped.pop("date_scraped", None)
 
             if message_dict['message'] == "":
                 continue
-            elif message_dict_without_date_scraped in StatVars.has_been_processed_without_date_scraped:
+            elif get_unique_identifier(message_dict) in StatVars.unique_identifiers:
                 # logging.info(f"message already exists for exchange {message_dict['exchange']}: "
                 #              f"{message_dict['message']}")
                 break
@@ -156,7 +189,10 @@ class BinanceScraper:
             if for_loops_count == 0:
                 send_force_exit_long()
                 send_force_enter_short()
+
         reset_static_variables()
+
+        # logging.info(f"successfully ran through {self.exchange}.scrape()")
 
     def read_messages(self, read_messages_driver, prev_message_count, first_try=False):
         stop_loop = False
@@ -166,16 +202,14 @@ class BinanceScraper:
 
         len_messages = len(messages)
         if len_messages == 0:
-            StatVars.logger.warning(f"{self.exchange}: we didn't find any messages!? "
-                                    f"Aborting for this loop... "
-                                    f"(if this doesnt happen multiple times in a row then you can ignore this message)")
-            return messages, len_messages, True  # we didn't find any messages, well let s just exit...
+            raise ValueError(f"{self.exchange}: we didn't find any messages!? "
+                             f"Aborting for this loop... "
+                             f"(if this doesnt happen multiple times in a row then you can ignore this message)")
 
         message_dict = self.prepare_message_dict(messages[0])
-        message_dict_without_date_scraped = copy.deepcopy(message_dict)
-        message_dict_without_date_scraped.pop("date_scraped", None)
+        unique_identifier = (message_dict.get("exchange"), message_dict.get("date"))
 
-        if message_dict_without_date_scraped in StatVars.has_been_processed_without_date_scraped:
+        if unique_identifier in StatVars.unique_identifiers:
             if not first_try:
                 StatVars.logger.info(
                     f"{self.exchange}: We found a message that has already been scraped. "
@@ -183,10 +217,10 @@ class BinanceScraper:
             stop_loop = True
         elif len_messages == prev_message_count:
             StatVars.logger.info(f"{self.exchange}: We found {prev_message_count} messages overall! "
-                                 f"The count didn't increase. "
-                                 f"Stopping...")
+                                 f"The count didn't increase. Stopping...")
             stop_loop = True
         elif self.initialScrollUpTimes == 0:
+            stop_loop = True
             pass
         else:
             StatVars.logger.info(
@@ -217,6 +251,8 @@ class BinanceScraper:
 
         return message_dict
 
+    # This was changed to specifically looking for prefixes since a pair W and T was blacklisted, which would
+    # blacklist all pairs ending on a T or W which ... sucks
     def get_blacklisted_coins(self, title: str):
         my_title = (title.upper()
                     .replace("and".upper(), " ")
@@ -225,9 +261,7 @@ class BinanceScraper:
                     .replace(".", " ")
                     .replace("(", " ")
                     .replace(")", " ")
-                    .replace("/", " ")
                     .replace("$", " ")
-                    .replace("https://".upper(), " https://".upper())
                     .strip()
                     )
 
@@ -237,25 +271,44 @@ class BinanceScraper:
             my_title = my_title.replace("  ", " ")
 
         set_title = set(my_title.strip().split(" "))
+        set_title_no_trailing_slash = [word.split('/')[0] for word in set_title]
 
         # prepare variables
         all_coins = {pair['id'].upper().replace("-", "") for pair in self.pairs.values()}
         all_coins.update({pair['base'].upper() for pair in self.pairs.values()})
 
         # Use list comprehension to build the set of coins directly
-        set_coins = {coin for coin in set_title if coin.upper() in all_coins}
+        set_coins = {coin for coin in set_title_no_trailing_slash if coin.upper() in all_coins}
 
         if len(set_coins) == 0:
             # report any news that did not contain a pair to be blacklisted
             logging.info(f"did not find any of those strings: {my_title}, "
                          f"maybe it wasn't a coin but a currency or it s not a coin that was on the exchange directly")
 
-        # now we add wildcards before and after the coin itself since we assume the ban is exchange wide
-        coins_with_wildcards = []
-        for coin in set_coins:
-            coins_with_wildcards.append(f".*{coin}/.*")
+        caught_coins = set()
+        for set_coin in set_coins:
+            # Add the coin itself without any prefix or suffix
+            pattern_coin_itself = f"{set_coin}/.*"
+            caught_coins.add(pattern_coin_itself)
 
-        return coins_with_wildcards
+            # Check all combinations of prefixes and suffixes
+            for prefix in self.coin_prefixes:
+                for suffix in self.coin_suffixes:
+                    # Construct potential coin combinations
+                    potential_coin_combo = f"{prefix}{set_coin}{suffix}".upper()
+                    potential_coin_prefix = f"{prefix}{set_coin}".upper()
+                    potential_coin_suffix = f"{set_coin}{suffix}".upper()
+
+                    # Check if any of these patterns match 'base' values in self.pairs
+                    for pair_key, pair_value in self.pairs.items():
+                        if 'base' in pair_value:
+                            base_value = pair_value['base'].upper()
+                            if (fnmatch.fnmatch(base_value, potential_coin_combo) or
+                                    fnmatch.fnmatch(base_value, potential_coin_prefix) or
+                                    fnmatch.fnmatch(base_value, potential_coin_suffix)):
+                                caught_coins.add(base_value)
+
+        return caught_coins
 
     def prepare_message_dict(self, message_html):
         message_text_elements = []
@@ -269,7 +322,7 @@ class BinanceScraper:
         else:
             stripped_message = ""
 
-        # Remove non-printable characters and multiple whitespaces
+        # Remove non-logging.infoable characters and multiple whitespaces
         message_content = re.sub(r'[^\x00-\x7F]+', ' ', stripped_message)
         message_content = re.sub(r'\s+', ' ', message_content)
         message_content = re.sub(r'(?i)(https://)', r' \1', message_content)
@@ -284,7 +337,7 @@ class BinanceScraper:
         message_dict = {
             "exchange": self.exchange,
             "date": msg_datetime.strftime(StatVars.datetimeFormat),
-            "date_scraped": datetime.utcnow().strftime(StatVars.datetimeFormat),
+            "date_scraped": datetime.now(timezone.utc).strftime(StatVars.datetimeFormat),
             "message": message_content,
             "linked_urls": urls,
             # to be filled in read_message, not to be saved into the bots file
@@ -308,6 +361,8 @@ class KucoinScraper(BinanceScraper):
 
     exchange = "kucoin"
     url = "https://t.me/s/Kucoin_News"
+    coin_prefixes = ["000"]
+    coin_suffixes = ["2L", "2S", "3L", "3S", "DOWN", "UP"]
 
     def read_message(self, message_dict):
         if message_dict is None:
@@ -339,7 +394,8 @@ class KucoinScraper(BinanceScraper):
             # If another website is stated here, then skip it. In the end we don't want to risk false positives
             if "https://www.kucoin.com/announcement" not in url:
                 continue
-            own_driver = webdriver.Chrome(options=StatVars.options)
+            own_driver = set_driver()
+
             own_driver.get(url.split('#')[0])
             html_source = own_driver.page_source
             soup = BeautifulSoup(html_source, "html.parser")
@@ -363,7 +419,8 @@ class KucoinScraper(BinanceScraper):
                         if not re.match(r'^\d+\.', txt):  # Paragraph does not start with a number
                             return " ".join(found_messages)
                         found_messages.append(txt)
-
+            own_driver.quit()
+            own_driver = None
         # return a space separated string of those found words
         return ""
 
@@ -371,6 +428,9 @@ class KucoinScraper(BinanceScraper):
 class BybitScraper(BinanceScraper):
     def __init__(self):
         super().__init__()
+
+    coin_prefixes = ["000"]
+    coin_suffixes = ["1000", "3L", "3S"]
 
     exchange = "bybit"
     url = "https://t.me/s/Bybit_Announcements"
@@ -401,6 +461,9 @@ class OkxScraper(BinanceScraper):
     def __init__(self):
         super().__init__()
 
+    coin_prefixes = []
+    coin_suffixes = []
+
     exchange = "okx"
     url = "https://t.me/s/OKXAnnouncements"
 
@@ -424,8 +487,13 @@ class GateioScraper(BinanceScraper):
     def __init__(self):
         super().__init__()
 
+    coin_prefixes = []
+    coin_suffixes = ["3L", "3S", "5L", "5S", "TOKEN", "PLATFORM"]
+
     exchange = "gateio"
     url = "https://t.me/s/GateioOfficialNews"
+
+
 
     def read_message(self, message_dict):
         if message_dict is None:
@@ -447,8 +515,11 @@ class HtxScraper(BinanceScraper):
     def __init__(self):
         super().__init__()
 
+    coin_prefixes = []
+    coin_suffixes = ["1S", "2L", "2S", "3L", "3S", "2X"]
+
     exchange = "htx"
-    url = "https://t.me/s/HTXGlobalAnnouncementChannel"
+    url = "https://t.me/htxglobalofficial"
 
     def read_message(self, message_dict):
         if message_dict is None:
@@ -541,20 +612,15 @@ def save_blacklist(exchange: str, new_blacklisted_pairs: []):
                 rapidjson.dump(data, json_file, indent=4)
 
 
-def update_has_been_processed_without_date_scraped():
-    StatVars.has_been_processed_without_date_scraped = copy.deepcopy(StatVars.has_been_processed)
-    for msg in StatVars.has_been_processed_without_date_scraped:
-        msg.pop("date_scraped", None)
-
-
 def open_processed():
     StatVars.logger.info("Loading local processed file")
     try:
+        set_unique_identifiers()
         # Read config from stdin if requested in the options
         with Path(StatVars.path_processed_file).open() if StatVars.path_processed_file != '-' else sys.stdin as file:
             StatVars.has_been_processed = rapidjson.load(file, parse_mode=StatVars.CONFIG_PARSE_MODE)
-        update_has_been_processed_without_date_scraped()
-
+        StatVars.unique_identifiers = set(
+            (entry["exchange"], entry["date"]) for entry in StatVars.has_been_processed)
     except FileNotFoundError:
         logging.error(f'Config file "{StatVars.path_processed_file}" not found!'
                       ' Please create a config file or check whether it exists.')
@@ -565,11 +631,12 @@ def open_processed():
 def save_processed():
     StatVars.logger.info("Saving local processed file")
     try:
-        update_has_been_processed_without_date_scraped()
+        set_unique_identifiers()
         sorted_json_obj = rapidjson.dumps(
             sorted(StatVars.has_been_processed, key=lambda x: (x['exchange'], x['date'])), indent=4)
         with open(StatVars.path_processed_file, "w") as outfile:
             outfile.write(sorted_json_obj)
+
     except Exception as e:
         logging.info(e)
 
@@ -580,7 +647,6 @@ def load_blacklist(config_file):
         # Read config from stdin if requested in the options
         with Path(config_file).open() if StatVars.path_processed_file != '-' else sys.stdin as file:
             StatVars.has_been_processed = rapidjson.load(file, parse_mode=StatVars.CONFIG_PARSE_MODE)
-        update_has_been_processed_without_date_scraped()
 
     except FileNotFoundError:
         logging.error(f'Config file "{StatVars.path_processed_file}" not found!'
@@ -612,25 +678,30 @@ def send_blacklists():
         if 'new_pair_blacklist' in bot_group:
             for ip in bot_group['ips']:
                 try:
-
                     api_bot = (
-                        freqtrade_client.FtRestClient(f"http://{ip}", bot_group['username'], bot_group['password']))
-                    blacklist_response = api_bot.blacklist()
-                    if blacklist_response is None:
-                        logging.warning(f"bot http://{ip} did not respond while trying to send the blacklist! "
-                                        f"Skipping")
-                        continue
-                    for pair in bot_group['new_pair_blacklist']:
-                        if pair in blacklist_response['blacklist']:
-                            logging.info(f"bot http://{ip}: Skipped sending the blacklist pair  {pair}"
-                                         f"Reason: pair exists already")
-                        else:
-                            result = api_bot.blacklist(pair)
-                            if 'error' in result:
-                                logging.error(f"bot http://{ip}: Attempted to send a blacklist pair and failed"
-                                              f"Error: {result['result']}")
+                        freqtrade_client.FtRestClient(
+                            f"http://{ip}", bot_group['username'], bot_group['password']))
+                    api_bot_status = api_bot.status()
+                    if isinstance(api_bot_status, list):
+                        blacklist_response = api_bot.blacklist()
+                        if blacklist_response is None:
+                            logging.warning(f"bot http://{ip} did not respond while trying to send the blacklist! "
+                                            f"Skipping")
+                            continue
+                        for pair in bot_group['new_pair_blacklist']:
+                            if pair in blacklist_response['blacklist']:
+                                logging.info(f"bot http://{ip}: Skipped sending the blacklist pair  {pair} "
+                                             f"Reason: pair exists already")
                             else:
-                                logging.info(f"bot http://{ip}: Successfully sent the pair {pair} to the blacklist")
+                                result = api_bot.blacklist(pair)
+                                if 'error' in result:
+                                    logging.error(f"bot http://{ip}: Attempted to send a blacklist pair and failed "
+                                                  f"Error: {result['result']}")
+                                else:
+                                    logging.info(f"bot http://{ip}: Successfully sent the pair {pair} to the blacklist")
+                    else:
+                        logging.warning(f"bot http://{ip}: connection failed. Skipping to send send_blacklists!")
+
                 except Exception as ex:
                     logging.error(f"An error occurred: {ex}")
 
@@ -641,15 +712,20 @@ def send_force_enter_short():
             if 'new_pair_blacklist' in bot_group:
                 for ip in bot_group['ips']:
                     api_bot = (
-                        freqtrade_client.FtRestClient(f"http://{ip}", bot_group['username'], bot_group['password']))
-                    for pair in bot_group['new_pair_blacklist']:
-                        result = api_bot.forceenter(pair, 'short')
-                        if 'error' in result:
-                            logging.error(f"bot http://{ip}: Attempted to force enter a short trade of {pair}"
-                                          f" and failed. Error: {result['result']}")
-                        else:
-                            logging.info(f"bot http://{ip}: Successfully sent a force enter short order "
-                                         f"of the pair {pair}")
+                        freqtrade_client.FtRestClient(
+                            f"http://{ip}", bot_group['username'], bot_group['password']))
+                    api_bot_status = api_bot.status()
+                    if isinstance(api_bot_status, list):
+                        for pair in bot_group['new_pair_blacklist']:
+                            result = api_bot.forceenter(pair, 'short')
+                            if 'error' in result:
+                                logging.error(f"bot http://{ip}: Attempted to force enter a short trade of {pair}"
+                                              f" and failed. Error: {result['result']}")
+                            else:
+                                logging.info(f"bot http://{ip}: Successfully sent a force enter short order "
+                                             f"of the pair {pair}")
+                    else:
+                        logging.warning(f"bot http://{ip}: connection failed. Skipping to send send_force_enter_short!")
 
 
 def send_force_exit_long():
@@ -658,19 +734,23 @@ def send_force_exit_long():
             if 'new_pair_blacklist' in bot_group:
                 for ip in bot_group['ips']:
                     api_bot = (
-                        freqtrade_client.FtRestClient(f"http://{ip}", bot_group['username'], bot_group['password']))
+                        freqtrade_client.FtRestClient(
+                            f"http://{ip}", bot_group['username'], bot_group['password']))
                     open_trades = api_bot.status()
-                    for pair in bot_group['new_pair_blacklist']:
-                        for open_trade in open_trades:
-                            if pair == open_trade['pair']:
-                                if not open_trade['is_short']:  # only exit long, not short
-                                    result = api_bot.forceexit(open_trade['trade_id'])
-                                    if 'error' in result:
-                                        logging.error(f"bot http://{ip}: Attempted to force exit a long trade of {pair}"
-                                                      f" and failed. Error: {result['result']}")
-                                    else:
-                                        logging.info(f"bot http://{ip}: Successfully sent a force-exit-long order "
-                                                     f"of the pair {pair}")
+                    if isinstance(open_trades, list):
+                        for pair in bot_group['new_pair_blacklist']:
+                            for open_trade in open_trades:
+                                if pair == open_trade['pair']:
+                                    if not open_trade['is_short']:  # only exit long, not short
+                                        result = api_bot.forceexit(open_trade['trade_id'])
+                                        if 'error' in result:
+                                            logging.error(f"bot http://{ip}: Attempted to force exit a long trade "
+                                                          f"of {pair} and failed. Error: {result['result']}")
+                                        else:
+                                            logging.info(f"bot http://{ip}: Successfully sent a force-exit-long order "
+                                                         f"of the pair {pair}")
+                    else:
+                        logging.warning(f"bot http://{ip}: connection failed. Skipping to send_force_exit_long!")
 
 
 # This checks all bots' connections ... just for the user as a sanity check
@@ -678,12 +758,13 @@ def check_all_bots():
     logging.info("checking all bot-connections:")
     for bot_group in StatVars.bot_groups:
         for ip in bot_group['ips']:
-            api_bot = (freqtrade_client.FtRestClient(f"http://{ip}", bot_group['username'], bot_group['password']))
+            api_bot = (freqtrade_client.FtRestClient(
+                f"http://{ip}", bot_group['username'], bot_group['password']))
             response = api_bot.status()
             if isinstance(response, list):
-                logging.info(f"connection to bot http://{ip}: connection successful!")
+                logging.info(f"bot http://{ip}: connection successful!")
             else:
-                logging.warning(f"connection to bot http://{ip}: connection failed?!")
+                logging.warning(f"bot http://{ip}: connection failed?!")
 
 
 def reset_static_variables():
@@ -710,7 +791,23 @@ def refresh_ccxt_exchange_pairs(exchanges_pairs):
             exchanges_pairs[exchange] = future.result()
 
 
+def handle_exception(ex1):
+    try:
+        StatVars.driver.quit()
+    except Exception as ex3:
+        logging.error(f"an error occurred: {ex3}")
+    try:
+        StatVars.driver = set_driver()
+    except Exception as ex2:
+        logging.error(f"an error occurred: {ex2}")
+    logging.error(f"An error occurred: {ex1}")
+    time.sleep(30)  # an error happened, could be anything ... even being rate limited ... Take a nap bot!
+
+
 def main():
+    StatVars.driver = set_driver()
+    # make the script not gobble up resources
+    os.nice(15)
     open_processed()
     load_bots_data()
 
@@ -731,9 +828,6 @@ def main():
 
     while True:
         try:
-            # Create the WebDriver instance
-            StatVars.driver = webdriver.Chrome(options=StatVars.options)
-
             StatVars.blacklist_changed = False
 
             # Only rescan if the minute is not modulo 5 == 0
@@ -749,34 +843,66 @@ def main():
                 time.sleep(60)
                 refresh_ccxt_exchange_pairs(exchanges_pairs)
                 heartbeat_time_pairs = datetime.now()
+                StatVars.driver.quit()
+                StatVars.driver = set_driver()
 
             start_time = time.monotonic()
+        except Exception as ex1:
+            handle_exception(ex1)
 
+        try:
             current_exchange = "binance"
             if current_exchange.lower() in exchanges_to_loop_through:
-                BinanceScraper().scrape(exchanges_pairs[current_exchange])
+                current_instance = BinanceScraper()
+                current_instance.scrape(exchanges_pairs[current_exchange])
+        except Exception as ex1:
+            handle_exception(ex1)
 
+        try:
             current_exchange = "bybit"
             if current_exchange.lower() in exchanges_to_loop_through:
-                BybitScraper().scrape(exchanges_pairs[current_exchange])
+                current_instance = BybitScraper()
+                current_instance.scrape(exchanges_pairs[current_exchange])
+        except Exception as ex1:
+            handle_exception(ex1)
 
+        try:
             current_exchange = "okx"
             if current_exchange.lower() in exchanges_to_loop_through:
-                OkxScraper().scrape(exchanges_pairs[current_exchange])
+                current_instance = OkxScraper()
+                current_instance.scrape(exchanges_pairs[current_exchange])
+        except Exception as ex1:
+            handle_exception(ex1)
 
+        try:
             current_exchange = "gateio"
             if current_exchange.lower() in exchanges_to_loop_through:
-                GateioScraper().scrape(exchanges_pairs[current_exchange])
+                current_instance = GateioScraper()
+                current_instance.scrape(exchanges_pairs[current_exchange])
+        except Exception as ex1:
+            handle_exception(ex1)
 
+        # HTX stopped working have to change the URL.
+        '''
+        try:
             current_exchange = "htx"
             if current_exchange.lower() in exchanges_to_loop_through:
-                HtxScraper().scrape(exchanges_pairs[current_exchange])
-
+                current_instance = HtxScraper()
+                current_instance.scrape(exchanges_pairs[current_exchange])
+                del current_instance
+        except Exception as ex1:
+            handle_exception(ex1)
+        '''
+        try:
             current_exchange = "kucoin"
             if current_exchange.lower() in exchanges_to_loop_through:
-                KucoinScraper().scrape(exchanges_pairs[current_exchange])
+                current_instance = KucoinScraper()
+                current_instance.scrape(exchanges_pairs[current_exchange])
+        except Exception as ex1:
+            handle_exception(ex1)
 
-            if datetime.now() - heartbeat_time >= timedelta(seconds=60):
+        try:
+            if datetime.now() - heartbeat_time >= timedelta(minutes=15):
                 # Execute heartbeat action
                 logging.info("delist-scraper heartbeat")
 
@@ -789,8 +915,10 @@ def main():
             logging.debug(f"for this loop we still have to wait for {time_to_sleep_left} seconds")
 
             time.sleep(StatVars.loop_secs - ((time.monotonic() - start_time) % StatVars.loop_secs))
-        except Exception as ex:
-            logging.error(f"An error occurred: {ex}")
+            # logging.info("looped once successfully")
+        except Exception as ex1:
+            handle_exception(ex1)
+        gc.collect()
 
 
 if __name__ == "__main__":

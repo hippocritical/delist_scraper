@@ -12,12 +12,22 @@ Backtesting is also facilitated as the 'processed.json' file contains pertinent 
 
 - **bot-groups.json:** This file stores details of all bots, including the exchanges to scrape, IPs, usernames, passwords, and the name of the blacklist to be used for local storage. With the provided configuration file (e.g., 'blacklist.json'), transitioning to a VPS and integrating a new blacklist configuration becomes straightforward.
 - **processed.json:** This file stores all news that were scraped.
+- **processed.json_prefilled.7z** This file is already pre-filled so the initial loop does not take for hours and does not need tons of RAM.
 
 ## Initial Loop Logic:
 
 Upon execution, the script first scrapes all news from the specified channels using a Chromium instance, which demands considerable memory resources. Once it collects all news items from an exchange, it saves the blacklist and 'processed.json', attempting to send the blacklisted pairs to all bots as specified in 'bot-groups.json'. It's advised not to perform this initial step on a low-memory VPS. Instead, it's recommended to conduct it locally and then transfer the JSON file to the VPS if necessary. Alternatively, ample swap space (e.g., 10GB) can facilitate scraping, especially for exchanges like KuCoin.
 
 **You can run this program on a weaker VPS or a Raspberry Pi with limited memory,** provided the initial data gathering is done on a more powerful machine. The initial run involves opening a browser window with approximately 20k messages, consuming over 8GB of memory. Subsequent runs are less resource-intensive.
+
+## A special case for the exchange Kraken:
+Kraken has abysmally slow download speeds, and additionally you have to download trade-data.
+If you want to have pairlists, then please download the premade data and convert them to daily jsongz candle data previously.
+This will speed up the calculation times by infinity.
+https://support.kraken.com/hc/en-us/articles/360047543791-Downloadable-historical-market-data-time-and-sales-
+
+https://www.freqtrade.io/en/stable/exchanges/#historic-kraken-data
+For more info please read the docs how to convert the premade csv trade-data to candle-data.
 
 ## Logic After Initial Loop:
 
@@ -39,7 +49,7 @@ The initial setup takes a lot of memory. It is advised to do the initial round o
 After the initial run you can easily run the scraper on a 1GB VPS with a weak CPU.
 
 ## Note on using ARM processors
-Selenium cannot run on ARM processors, sorry.
+Geckodriver only supports 64bit arm processors via precompiled releases out of the box.
 
 ## Setup Process:
 
@@ -66,7 +76,7 @@ nano bot-groups.json
 ## Non-docker
 ```
 bash install.sh
-bash install_chrome.sh
+bash install_firefox.sh
 source .venv/bin/activate
 bash run.sh
 ```
@@ -74,11 +84,11 @@ bash run.sh
 
 ## Docker
 ```
-docker-compose up -d --build
+docker compose up --build
 ```
 
 # Frequenthippo - analytics
-We have a website on http://frequenthippo.ddns.net:3000 which contains masses of dry runs and live runs, as well as backtest data.
+We have a website on http://frequenthippo.ddns.net which contains masses of dry runs and live runs, as well as backtest data.
 You are welcome to join our community!
 Please join our discord, the link is on the website.
 
