@@ -12,6 +12,6 @@ services:
     restart: unless-stopped
   
   firefox:
-    image: selenium/standalone-firefox
+    image: selenium/firefox-node
     shm_size: 10g
     restart: unless-stopped
