@@ -7,3 +7,4 @@ webdriver-manager
 tqdm
 ccxt
 freqtrade_client
+tqdm

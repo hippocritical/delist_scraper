@@ -71,8 +71,8 @@ def set_driver():
     driver = webdriver.Firefox(service=service, options=options)
 
     # Set timeouts
-    driver.set_page_load_timeout(60)  # Set the page load timeout to 60 seconds
-    driver.implicitly_wait(60)  # Set the implicit wait timeout to 60 seconds
+    driver.set_page_load_timeout(120)  # Set the page load timeout to 60 seconds
+    driver.implicitly_wait(120)  # Set the implicit wait timeout to 60 seconds
 
     # logging.info("Firefox WebDriver initialized successfully")
     return driver
