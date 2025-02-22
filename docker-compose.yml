@@ -3,7 +3,6 @@ version: '3.8'
 services:
   exchange_scraper:
     build: .
-    network_mode: host  # Set the network mode to host
     volumes:
       - .:/app
     working_dir: /app
