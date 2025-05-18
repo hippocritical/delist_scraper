@@ -10,8 +10,16 @@ services:
     environment:
       - PYTHONUNBUFFERED=1
     restart: unless-stopped
+    depends_on:
+      - firefox  # Ensures firefox starts first
   
   firefox:
     image: selenium/standalone-firefox
-    shm_size: 10g
+    shm_size: 1g
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:4444/wd/hub/status"] # Checks if Selenium WebDriver is responsive
+      interval: 30s  # Check every 30 seconds
+      timeout: 10s  # Timeout after 10 seconds
+      retries: 3  # Mark as unhealthy after 3 failures
+      start_period: 30s  # Wait 30s before running the first check

@@ -20,15 +20,6 @@ Upon execution, the script first scrapes all news from the specified channels us
 
 **You can run this program on a weaker VPS or a Raspberry Pi with limited memory,** provided the initial data gathering is done on a more powerful machine. The initial run involves opening a browser window with approximately 20k messages, consuming over 8GB of memory. Subsequent runs are less resource-intensive.
 
-## A special case for the exchange Kraken:
-Kraken has abysmally slow download speeds, and additionally you have to download trade-data.
-If you want to have pairlists, then please download the premade data and convert them to daily jsongz candle data previously.
-This will speed up the calculation times by infinity.
-https://support.kraken.com/hc/en-us/articles/360047543791-Downloadable-historical-market-data-time-and-sales-
-
-https://www.freqtrade.io/en/stable/exchanges/#historic-kraken-data
-For more info please read the docs how to convert the premade csv trade-data to candle-data.
-
 ## Logic After Initial Loop:
 
 After completing the initial loop, the program continues to monitor for fresh news. When new delisting announcements are detected, the affected pairs are added to the blacklist as defined in 'bot-groups.json'. Additionally, if the 'signal force_enter_new_blacklisted_pairs' parameter is set to true, the program sends force-short-entry and force-long-exit signals to the relevant bots.

@@ -1,25 +1,39 @@
-import concurrent.futures
 import gc
 import logging
-
 import os
 import re
 import sys
 import time
-from concurrent.futures import ThreadPoolExecutor
+import unicodedata
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-import fnmatch
-
-from tqdm import tqdm
-from bs4 import BeautifulSoup
-import rapidjson
 
 import ccxt
 import freqtrade_client
-
+import rapidjson
+# import telethon
+from bs4 import BeautifulSoup
 from selenium import webdriver
+from selenium.webdriver.common.by import By
 from selenium.webdriver.firefox.service import Service as FirefoxService
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.support.ui import WebDriverWait
+from telethon.sync import TelegramClient  # Sync-compatible client
+
+
+# Some exchanges use non-normalized letters which can throw off the comparison and finding of those pairs.
+# So we normalize any message-string.
+def remove_markdown_from_text(text):
+    # Normalize Unicode (e.g., full-width characters)
+    normalized = unicodedata.normalize('NFKC', text)
+
+    # Remove common Markdown formatting characters
+    cleaned = re.sub(r'[*_`~]', '', normalized)
+
+    # Remove Markdown-style links: [text](url) → text
+    cleaned = re.sub(r'\[([^\]]+)\]\([^)]+\)', r'\1', cleaned)
+
+    return cleaned.strip()
 
 
 class StatVars:
@@ -28,6 +42,8 @@ class StatVars:
 
     path_processed_file = 'processed.json'
     path_bots_file = 'bot-groups.json'
+    path_telegram_config = 'telegram_config.json'
+
     CONFIG_PARSE_MODE = rapidjson.PM_COMMENTS | rapidjson.PM_TRAILING_COMMAS
 
     has_been_processed = []
@@ -38,13 +54,19 @@ class StatVars:
     bot_groups = []
     datetimeFormat = '%Y-%m-%dT%H:%M:%S%z'
 
-    loop_secs = 10
+    loop_secs = 30
 
     logging.basicConfig(
         level=logging.INFO,
         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     )
     logger = logging.getLogger(__name__)
+
+    telethon_client = None
+    telegram_config = {}
+
+    # Add Telethon session file path
+    session_file = 'telegram.session'
 
     driver = None
 
@@ -54,11 +76,11 @@ def set_driver():
     # Set up Firefox options
     options = webdriver.FirefoxOptions()
     options.add_argument("--headless")
-    #options.add_argument("--no-sandbox")
-    #options.add_argument("--disable-dev-shm-usage")
+    # options.add_argument("--no-sandbox")
+    # options.add_argument("--disable-dev-shm-usage")
     options.set_preference("intl.accept_languages", "en")
     options.set_preference("permissions.default.image", 2)  # Disable loading images
-    #options.add_argument("--single-process")
+    # options.add_argument("--single-process")
     options.add_argument("--disable-crash-reporter")
     options.add_argument("--disable-infobars")
 
@@ -78,6 +100,30 @@ def set_driver():
     return driver
 
 
+def init_telethon():
+    """Initialize Telethon client"""
+    #try:
+    # Load Telethon config
+    with open('telegram_config.json') as f:
+        StatVars.telegram_config = rapidjson.load(f)
+
+    StatVars.telethon_client = TelegramClient(
+        StatVars.session_file,  # Use your session_file variable
+        StatVars.telegram_config['api_id'],
+        StatVars.telegram_config['api_hash'],
+        # the code is sync to not run into api limits, but hey ... better safe than sorry
+        flood_sleep_threshold=10,
+        request_retries=3,
+        retry_delay=5
+    )
+
+    StatVars.telethon_client.start(phone=StatVars.telegram_config['phone_number'])
+
+    #except Exception as e:
+    #    logging.error(f"Failed to initialize Telethon: {e}")
+    #    raise
+
+
 def report_to_be_processed():
     for message_dict in StatVars.to_be_processed:
         logging.info(f"caught fresh news for {message_dict['exchange']}: {message_dict['message']}")
@@ -87,23 +133,29 @@ def report_to_be_processed():
 def get_exchange_pairs(exchange_name):
     sleep_timer_on_error = 60
     while True:
-        try:
-            exchange_class = getattr(ccxt, exchange_name)
-            exchange = exchange_class({
-                'timeout': 30000,
-                'enableRateLimit': True,
-                'rateLimit': 500,  # don't even try to endanger any potential bots by spamming the exchange
-            })
-            # Get available markets on exchange
-            markets = exchange.load_markets()
-            if markets:
-                logging.info(f"Refreshing pairs for exchange {exchange}, we found {len(markets)} pairs.")
-                return markets
-            else:
-                logging.info(f"No markets available for {exchange_name}. Retrying after {sleep_timer_on_error}s ...")
-                time.sleep(sleep_timer_on_error)
-        except Exception as e:
-            logging.info(f"Error fetching markets for {exchange_name}: {e}. Retrying after {sleep_timer_on_error}s ...")
+        #try:
+        exchange_class = getattr(ccxt, exchange_name)
+        exchange = exchange_class({
+            'timeout': 30000,
+            'enableRateLimit': True,
+            'rateLimit': 500,  # don't even try to endanger any potential bots by spamming the exchange
+        })
+        # Get available markets on exchange
+        markets = exchange.load_markets()
+
+        #if any("GFT" in key.upper() for key in markets.keys()):
+        #    print("GFT is present in the market pairs.")
+        #else:
+        #    print("GFT is not present in the market pairs.")
+
+        if markets:
+            logging.info(f"We found {len(markets)} pairs for the Exchange {exchange}.")
+            return markets
+        else:
+            logging.info(f"No markets available for {exchange_name}. Retrying after {sleep_timer_on_error}s ...")
+            time.sleep(sleep_timer_on_error)
+        #except Exception as e:
+        #    logging.info(f"Error fetching markets for {exchange_name}: {e}. Retrying after {sleep_timer_on_error}s ...")
 
 
 def get_unique_identifier(message_dict):
@@ -118,471 +170,418 @@ def set_unique_identifiers():
     pass
 
 
-class BinanceScraper:
-    exchange = "binance"
-    coin_prefixes = ["000"]
-    coin_suffixes = ["DOWN", "UP", "BEAR", "BULL"]
+class TelegramScraper:
+    def __init__(self):
+        self.exchange = ""
+        self.channel_username = ""
+        self.coin_prefixes = []
+        self.coin_suffixes = []
+        self.pairs = None
+        self.message_limit = 100
+        self.offset_id = 0
+        self.found_processed = False
+        self.sleep_secs_between_queries = 1
+        self.sleep_secs_at_error = 60
+        self.delist_website = ""
+        self.previously_found_messages = 0
 
-    url = "https://t.me/s/binance_announcements"
+    def scrape(self):
+        # try:
+        telegram_channel = StatVars.telethon_client.get_entity(self.channel_username)
+        while not self.found_processed:
+            if len(StatVars.to_be_processed) > 0:
+                logging.info(f"Found {len(StatVars.to_be_processed)} messages in {self.channel_username} "
+                             f"that weren't registered. Asking for more!")
+                time.sleep(
+                    self.sleep_secs_between_queries)  # 1 sec sleep to not hit api limits, better safe than sorry.
+            messages = StatVars.telethon_client.get_messages(
+                telegram_channel,
+                limit=self.message_limit,
+                offset_id=self.offset_id
+            )
 
-    initialScrollUpTimes = 200
-    initialWaitSeconds = 0
+            if not messages:
+                break  # Reached the beginning of the channel
 
-    message_bubble = "tgme_widget_message_wrap"
-    message_text = ["tgme_widget_message_text"]
-    message_date = {"type": "a",
-                    "class": "tgme_widget_message_date",
-                    "format": "%Y-%m-%dT%H:%M:%S%z"}
-    pairs = None
+            for message in messages:
+                self.offset_id = message.id  # update for next batch
 
-    def scrape(self, pairs):
-        self.pairs = pairs
+                prepared_message_dict = prepare_message_dict_template(self.exchange, message)
+                message_dict = self.read_message(prepared_message_dict)
 
-        StatVars.driver.get(self.url)
-        time.sleep(self.initialWaitSeconds)
+                if not message_dict or message_dict['message'] == "":
+                    continue
 
-        for_loops_count = 0
-        prev_message_count = 0
-        # scan once without scrolling to have the loop faster if we just need to scrape the first 20 ish messages
-        messages, prev_message_count, stop_loop = self.read_messages(StatVars.driver, prev_message_count, True)
-        current_scroll_up_times = self.initialScrollUpTimes
-        if self.initialScrollUpTimes > 0:
-            while not stop_loop:
-                # scrolling several times to make the overall loop faster, uses tqdm for a progression bar
-                for _ in tqdm(range(current_scroll_up_times), desc=f"Scrolling up to fetch more news for "
-                                                                   f"{self.exchange}", unit="scroll"):
-                    StatVars.driver.execute_script("window.scrollTo(0, 0);")
-                    time.sleep(StatVars.scrollUpSleepTime)
-                    for_loops_count += 1
-                messages, prev_message_count, stop_loop = self.read_messages(StatVars.driver, prev_message_count)
-                # stop_loop = True  # enable for quicker debugging, so it only scrolls for one rotation
-        # now fill the message_html
-        for message_html in messages[::-1]:
-            prepared_message_dict = self.prepare_message_dict(message_html)
-            message_dict = self.read_message(prepared_message_dict)
+                unique_id = get_unique_identifier(message_dict)
 
-            if message_dict['message'] == "":
-                continue
-            elif get_unique_identifier(message_dict) in StatVars.unique_identifiers:
-                # logging.info(f"message already exists for exchange {message_dict['exchange']}: "
-                #              f"{message_dict['message']}")
-                break
-            else:
-                StatVars.to_be_processed.append(message_dict)
+                if unique_id in StatVars.unique_identifiers:
+                    self.found_processed = True
+                    break
+                else:
+                    StatVars.to_be_processed.append(message_dict)
 
-        if len(StatVars.to_be_processed) > 0:
+        if StatVars.to_be_processed:
             StatVars.has_been_processed.extend(StatVars.to_be_processed)
             report_to_be_processed()
             save_processed()
 
-        # make one big list of newly delisted pairs
-        new_blacklist = []
-        for message_dict in StatVars.to_be_processed:
-            if message_dict is None:
-                continue
-            new_blacklist.extend(message_dict["blacklisted_pairs"])
+            new_blacklist = []
+            for message_dict in StatVars.to_be_processed:
+                if message_dict:
+                    new_blacklist.extend(message_dict["blacklisted_pairs"])
 
-        if len(new_blacklist) > 0:
-            save_blacklist(self.exchange, new_blacklist)
-            send_blacklists()
-            # only do this if the bot didn't initially gather (or: just react on fresh news)
-            if for_loops_count == 0:
-                send_force_exit_long()
-                send_force_enter_short()
+            if new_blacklist:
+                save_blacklist(self.exchange, new_blacklist)
+                send_blacklists()
+                if len(messages) == self.message_limit:
+                    send_force_exit_long()
+                    send_force_enter_short()
 
         reset_static_variables()
+        # except Exception as e:
+        #     logging.error(f"Error scraping {self.exchange}: {e}")
+        #     time.sleep(self.sleep_secs_at_error)
 
-        # logging.info(f"successfully ran through {self.exchange}.scrape()")
-
-    def read_messages(self, read_messages_driver, prev_message_count, first_try=False):
+    def read_messages(self, prev_message_count, first_try=False):
         stop_loop = False
-        html_source = read_messages_driver.page_source
-        soup = BeautifulSoup(html_source, "html.parser")
-        messages = soup.find_all("div", class_=self.message_bubble)
+
+        # try:
+        channel_entity = StatVars.telethon_client.get_entity(self.channel_username)
+
+        messages = StatVars.telethon_client.get_messages(
+            channel_entity,
+            limit=self.message_limit
+        )
 
         len_messages = len(messages)
         if len_messages == 0:
-            raise ValueError(f"{self.exchange}: we didn't find any messages!? "
-                             f"Aborting for this loop... "
-                             f"(if this doesnt happen multiple times in a row then you can ignore this message)")
+            raise ValueError(f"{self.exchange}: No messages found in channel!")
 
-        message_dict = self.prepare_message_dict(messages[0])
+        message_dict = prepare_message_dict_template(self.exchange, messages[0])
         unique_identifier = (message_dict.get("exchange"), message_dict.get("date"))
 
         if unique_identifier in StatVars.unique_identifiers:
             if not first_try:
                 StatVars.logger.info(
-                    f"{self.exchange}: We found a message that has already been scraped. "
-                    f"Stopping to get additional news!")
+                    f"{self.exchange}: Found already processed message. "
+                    f"Stopping further processing.")
             stop_loop = True
         elif len_messages == prev_message_count:
-            StatVars.logger.info(f"{self.exchange}: We found {prev_message_count} messages overall! "
-                                 f"The count didn't increase. Stopping...")
+            StatVars.logger.info(
+                f"{self.exchange}: Message count unchanged ({prev_message_count}). Stopping.")
             stop_loop = True
-        elif self.initialScrollUpTimes == 0:
+        elif self.message_limit == 0:  # Equivalent to initialScrollUpTimes == 0
             stop_loop = True
-            pass
         else:
             StatVars.logger.info(
-                f"{self.exchange}: Count of additional messages fetched in this loop: "
-                f"{len_messages - prev_message_count}, now: {len_messages}. Continuing")
+                f"{self.exchange}: Processing {len_messages} messages. "
+                f"New messages: {len_messages - prev_message_count}")
 
         return messages, len_messages, stop_loop
 
-    def read_message(self, message_dict):
-        if message_dict is None:
-            return None
+    def read_message(self, prepared_message_dict):
+        raise "This method is not initialized in the main class itself, please use it in the derived classes."
 
-        delist_string = "BINANCE WILL DELIST "
-        if "Binance Will Delist All ".upper() in message_dict['message'].upper():
-            delist_string = "Binance Will Delist All "
-        if "Binance Will Delist StableUSD".upper() in message_dict['message'].upper():
-            pass
-        elif "Binance Will Delist All FTX Leveraged Tokens".upper() in message_dict['message'].upper():
-            pass
-        elif "Binance Will Delist FTT Margin Pairs".upper() in message_dict['message'].upper():
-            pass
-        elif "DERIVATIVE".upper() in message_dict['message'].upper():
-            pass
-        elif delist_string.upper() in message_dict['message'].upper():
-            arr_coins = self.get_blacklisted_coins(message_dict['message'])
-            if arr_coins is not []:
-                message_dict['blacklisted_pairs'].extend(arr_coins)
-
-        return message_dict
-
-    # This was changed to specifically looking for prefixes since a pair W and T was blacklisted, which would
-    # blacklist all pairs ending on a T or W which ... sucks
-    def get_blacklisted_coins(self, title: str):
-        my_title = (title.upper()
-                    .replace("and".upper(), " ")
-                    .replace("&".upper(), " ")
-                    .replace(",", " ")
-                    .replace(".", " ")
-                    .replace("(", " ")
-                    .replace(")", " ")
-                    .replace("$", " ")
-                    .strip()
-                    )
-
-        # make splitting things easier by removing double spaces
-        # (not strictly necessary but hey, ease of debugging > all)
-        while "  " in my_title:
-            my_title = my_title.replace("  ", " ")
-
-        set_title = set(my_title.strip().split(" "))
-        set_title_no_trailing_slash = [word.split('/')[0] for word in set_title]
-
-        # prepare variables
-        all_coins = {pair['id'].upper().replace("-", "") for pair in self.pairs.values()}
-        all_coins.update({pair['base'].upper() for pair in self.pairs.values()})
-
-        # Use list comprehension to build the set of coins directly
-        set_coins = {coin for coin in set_title_no_trailing_slash if coin.upper() in all_coins}
-
-        if len(set_coins) == 0:
-            # report any news that did not contain a pair to be blacklisted
-            logging.info(f"did not find any of those strings: {my_title}, "
-                         f"maybe it wasn't a coin but a currency or it s not a coin that was on the exchange directly")
-
-        caught_coins = set()
-        for set_coin in set_coins:
-            # Add the coin itself without any prefix or suffix
-            pattern_coin_itself = f"{set_coin}/.*"
-            caught_coins.add(pattern_coin_itself)
-
-            # Check all combinations of prefixes and suffixes
-            for prefix in self.coin_prefixes:
-                for suffix in self.coin_suffixes:
-                    # Construct potential coin combinations
-                    potential_coin_combo = f"{prefix}{set_coin}{suffix}".upper()
-                    potential_coin_prefix = f"{prefix}{set_coin}".upper()
-                    potential_coin_suffix = f"{set_coin}{suffix}".upper()
-
-                    # Check if any of these patterns match 'base' values in self.pairs
-                    for pair_key, pair_value in self.pairs.items():
-                        if 'base' in pair_value:
-                            base_value = pair_value['base'].upper()
-                            if (fnmatch.fnmatch(base_value, potential_coin_combo) or
-                                    fnmatch.fnmatch(base_value, potential_coin_prefix) or
-                                    fnmatch.fnmatch(base_value, potential_coin_suffix)):
-                                caught_coins.add(base_value)
-
-        return caught_coins
-
-    def prepare_message_dict(self, message_html):
-        message_text_elements = []
-        for div in self.message_text:
-            tag = message_html.find("div", class_=div)
-            if tag is not None:
-                message_text_elements.append(tag.text.strip())
-
-        if len(message_text_elements) > 0:
-            stripped_message = " _-_ ".join(message_text_elements)
-        else:
-            stripped_message = ""
-
-        # Remove non-logging.infoable characters and multiple whitespaces
-        message_content = re.sub(r'[^\x00-\x7F]+', ' ', stripped_message)
-        message_content = re.sub(r'\s+', ' ', message_content)
-        message_content = re.sub(r'(?i)(https://)', r' \1', message_content)
-
-        # Replace double quotes with single quotes to not have to have \" in the strings and keep the quotes
-        message_content = message_content.replace('"', "'")
-
-        msg_datetime = self.extract_datetime(message_html)
-
-        urls = re.findall(r'\bhttps://\S+', message_content, re.IGNORECASE)
-
-        message_dict = {
-            "exchange": self.exchange,
-            "date": msg_datetime.strftime(StatVars.datetimeFormat),
-            "date_scraped": datetime.now(timezone.utc).strftime(StatVars.datetimeFormat),
-            "message": message_content,
-            "linked_urls": urls,
-            # to be filled in read_message, not to be saved into the bots file
-            # - just in the blacklist.json file of the bot
-            "blacklisted_pairs": [],
-        }
-
-        return message_dict
-
-    def extract_datetime(self, message_html):
-        if self.message_date['format'] == "":
-            return datetime(1970, 1, 1)  # Return a default datetime object
-        datetime_html = message_html.find(self.message_date['type'], class_=self.message_date['class'])
-        msg_datetime = datetime.strptime(datetime_html.contents[0].attrs['datetime'], self.message_date['format'])
-        return msg_datetime
+    def read_web_message(self, dict_message):
+        raise "This method is not initialized in the main class itself, please use it in the derived classes."
 
 
-class KucoinScraper(BinanceScraper):
+class BinanceScraper(TelegramScraper):
     def __init__(self):
         super().__init__()
-
-    exchange = "kucoin"
-    url = "https://t.me/s/Kucoin_News"
-    coin_prefixes = ["000"]
-    coin_suffixes = ["2L", "2S", "3L", "3S", "DOWN", "UP"]
+        self.exchange = "binance"
+        self.channel_username = "binance_announcements"  # Telegram channel username
+        self.coin_prefixes = ["000"]
+        self.coin_suffixes = ["DOWN", "UP", "BEAR", "BULL"]
+        self.delist_website = ""
 
     def read_message(self, message_dict):
-        if message_dict is None:
+        if not message_dict:
             return None
 
-        if "DAILY REPORT".upper() in message_dict['message'].upper():
-            pass
-        elif "KuCoin Will Delist the Sandbox Mode".upper() in message_dict['message'].upper():
-            pass
-        elif "DERIVATIVE".upper() in message_dict['message'].upper():
-            pass
-        elif "KuCoin Will Delist Certain Projects".upper() in message_dict['message'].upper():
-            # found an indirect reference of pairs, searching...
-            found_subpage_coins = self.read_message_of_news(message_dict['linked_urls'])
-            arr_coins = self.get_blacklisted_coins(found_subpage_coins)
-            message_dict['blacklisted_pairs'].extend(arr_coins)
-        elif (
-                "KUCOIN WILL DELIST THE".upper() in message_dict['message'].upper() or
-                "WILL BE REMOVED FROM THE EXCHANGE".upper() in message_dict['message'].upper() or
-                "RISK ANNOUNCEMENT".upper() in message_dict['message'].upper() or
-                "WILL BE DELISTED FROM KUCOIN".upper() in message_dict['message'].upper()):
-            arr_coins = self.get_blacklisted_coins(message_dict['message'])
-            message_dict['blacklisted_pairs'].extend(arr_coins)
+        gimme_patterns = []
+        delist_patterns = [
+            r"delist"
+        ]
+
+        reject_patterns = [
+            r"introduces",
+            r"vote to delist",
+            r"binance will delist non-mica",
+            r"delisting of binance loans",
+            r"suspension of .* deposits",
+            r"Notice on the Withdrawals of",
+            r"from Cross and Isolated Margin",
+            r"Binance Margin & Binance Futures Will Delist BUSD"
+        ]
+
+        # Debug steps, leaving this in so it s quicker to debug.
+        if any(re.search(pattern, message_dict['message'], re.IGNORECASE) for pattern in gimme_patterns):
+            pass  # return the message_dict without looking into blacklisted pairs
+        # Check for rejection
+        elif any(re.search(pattern, message_dict['message'], re.IGNORECASE) for pattern in reject_patterns):
+            pass  # return the message_dict without looking into blacklisted pairs
+        # Check for delisting
+        elif any(re.search(pattern, message_dict['message'], re.IGNORECASE) for pattern in delist_patterns):
+            arr_coins = self.read_message_text(message_dict)
+            if arr_coins:
+                message_dict['blacklisted_pairs'].extend(arr_coins)
+                StatVars.logger.info(f"Found delisting announcement for {self.exchange}: {arr_coins}")
+
         return message_dict
 
-    def read_message_of_news(self, urls):
-        found_messages = []
-        for url in urls:
-            # If another website is stated here, then skip it. In the end we don't want to risk false positives
-            if "https://www.kucoin.com/announcement" not in url:
+    def read_message_text(self, message_dict):
+
+        patterns = [
+            re.compile(r"^binance will delist\s+([A-Z0-9,\sand]+?)\s+(on|\(|by)", re.IGNORECASE),
+            # You can add more patterns here if needed
+            # re.compile(r"...")
+        ]
+
+        for pattern in patterns:
+            match = pattern.search(message_dict['message'])
+            if match:
+                raw_list = match.group(1)
+                # Split by comma or 'and' with ignorecase
+                delisted_coins = [coin.strip() for coin in re.split(r",|\band\b", raw_list, flags=re.IGNORECASE)]
+                logging.info(f"Delisted coins extracted: {delisted_coins}")
+                return set(delisted_coins)
+
+        return set()
+
+
+class KucoinScraper(TelegramScraper):
+    def __init__(self):
+        super().__init__()
+        self.exchange = "kucoin"
+        self.channel_username = "Kucoin_News"
+        self.coin_prefixes = ["000"]
+        self.coin_suffixes = ["2L", "2S", "3L", "3S", "DOWN", "UP"]
+        StatVars.driver = set_driver()
+
+    def read_message(self, message_dict):
+        if not message_dict:
+            return None
+
+        gimme_patterns = []
+        delist_patterns = [
+            "delist",
+        ]
+        web_scraper_patterns = [
+            "Delist .*Certain Project",
+            # "KuCoin Will Delist Certain Projects",
+            "KuCoin .*Delist.* Projects"
+        ]
+
+        reject_patterns = [
+            "perpetual contract",
+            "Earn will delist",
+            "The Margin Grid",
+            "Trading Bot",
+            "KuCoin Convert Will",
+            "Delisting Optimization",
+            "KuCoin Will Delist .* Spot Trading Pairs",
+            'Leveraged Tokens',
+            "KuCoin Earn",
+            "contract",
+            "KuCoin Convert",
+            "KuCoin Will Launch",
+            "Sandbox mode"
+        ]
+
+        # first we deny anything without the word "delist" in it
+        if "delist" not in message_dict['message']:
+            return message_dict
+
+        # then all those contracts etc, we just want full removals not any fringe /BUSD pairs etc triggering a blacklist
+        if any(re.search(pattern, message_dict['message'], re.IGNORECASE) for pattern in reject_patterns):
+            return message_dict  # return the message_dict without looking into blacklisted pairs
+
+        # Debug steps, leaving this in so it s quicker to debug.
+        if any(re.search(pattern, message_dict['message'], re.IGNORECASE) for pattern in gimme_patterns):
+            pass  # return the message_dict without looking into blacklisted pairs
+
+        if any(re.search(pattern, message_dict['message'], re.IGNORECASE) for pattern in web_scraper_patterns):
+            message_dict = self.read_web_message(message_dict)
+
+        if any(re.search(pattern, message_dict['message'], re.IGNORECASE) for pattern in delist_patterns):
+            message_dict = self.read_message_text(message_dict)
+
+        if len(message_dict['blacklisted_pairs']) == 0:
+            logging.info("Uh oh we didnt find any pairs with the scraping? Time to debug what's going on !!")
+        return message_dict
+
+    def read_message_text(self, message_dict):
+        patterns = [
+            re.compile(r'\(([A-Z0-9]+)\)\s+Token', re.IGNORECASE),  # original
+            re.compile(r'delist\s+the\s+([A-Z0-9]+)\s+Project', re.IGNORECASE),  # new pattern
+        ]
+        found_token = False
+        tokens_found_here = []
+        for pattern in patterns:
+            match = pattern.search(message_dict['message'])
+            if match:
+                found_token = True
+                token = match.group(1).upper()
+
+                message_dict['blacklisted_pairs'].append(token)
+                tokens_found_here.append(token)
+        if found_token:
+            logging.info(f"read_message_text: Delisted token: {tokens_found_here} "
+                         f"from text {message_dict['message']}")
+        return message_dict
+
+    def read_web_message(self, message_dict):
+        for url in message_dict['linked_urls']:
+            if "202306009" in url:
+                pass
+            if "https://www.kucoin.com/announcement" not in url.lower() and "https://www.kucoin.com/news" not in url.lower():
                 continue
-            own_driver = set_driver()
 
-            own_driver.get(url.split('#')[0])
-            html_source = own_driver.page_source
+            StatVars.driver.get(url)
+
+            try:
+                # Wait until the div is there ... or 10s
+                WebDriverWait(StatVars.driver, 10).until(
+                    EC.presence_of_element_located((By.CLASS_NAME, "kucoin-article_oXGwp"))
+                )
+
+                # Additional wait until the article's text content is non-empty ... or 10s
+                WebDriverWait(StatVars.driver, 10).until(
+                    lambda driver: driver.find_element(By.CLASS_NAME, "kucoin-article_oXGwp").text.strip() != ""
+                )
+                time.sleep(1)  # additional time waiting since STILL it wont sometimes work properly ...
+            except Exception as e:
+                logging.warning(f"Timeout waiting for article content at {url}: {e}")
+                continue
+
+            # Parse the page source with BeautifulSoup
+            html_source = StatVars.driver.page_source
             soup = BeautifulSoup(html_source, "html.parser")
-            articles = soup.find_all("div")
 
-            # we already know that the pairs names are surrounded by ( and )
-            # so we just have to find those words and remove ( and )
+            article_div = soup.find("div", class_="kucoin-article_oXGwp")
+            if article_div:
+                article_text = article_div.get_text()
+                text = remove_markdown_from_text(article_text)
+                if text:
+                    message_dict['message'] += f" || {url}: {text}"
 
-            collecting = False
-            for article in articles:
-                paragraphs = article.find_all("p")
-                for paragraph in paragraphs:
-                    txt = paragraph.get_text(separator=" ", strip=True)
-                    if txt == '':
-                        pass
-                    elif re.match(r'^\d+\.', txt):  # Paragraph starts with a number followed by a period
-                        collecting = True
-                        hits = re.findall(r'\(\w+\)', txt)
-                        found_messages.extend(hit.strip('()') for hit in hits)
-                    elif collecting:
-                        if not re.match(r'^\d+\.', txt):  # Paragraph does not start with a number
-                            return " ".join(found_messages)
-                        found_messages.append(txt)
-            own_driver.quit()
-            own_driver = None
-        # return a space separated string of those found words
-        return ""
+                    # Extract coin symbols enclosed in parentheses, excluding certain terms
+                    arr_coins = re.findall(r'\(\s*(?!UTC|GMT|Twitter)([A-Z0-9]+)\s*\)', text, flags=re.IGNORECASE)
+
+                    message_dict['blacklisted_pairs'].extend(arr_coins)
+            else:
+                logging.warning(f"Article content not found at {url}")
+        if len(message_dict['blacklisted_pairs']) == 0:
+            pass
+        return message_dict
 
 
-class BybitScraper(BinanceScraper):
+class BybitScraper(TelegramScraper):
     def __init__(self):
         super().__init__()
+        self.coin_prefixes = ["000"]
+        self.coin_suffixes = ["1000", "3L", "3S"]
+        self.exchange = "bybit"
+        self.channel_username = "Bybit_Announcements"
 
-    coin_prefixes = ["000"]
-    coin_suffixes = ["1000", "3L", "3S"]
-
-    exchange = "bybit"
-    url = "https://t.me/s/Bybit_Announcements"
+    def prepare_message_dict(self, message):
+        return prepare_message_dict_template(self.exchange, message)
 
     def read_message(self, message_dict):
         if message_dict is None:
             return None
 
-        if "Contact".upper() in message_dict['message'].upper():
-            pass
-        if "Perpetual".upper() in message_dict['message'].upper():
-            pass
-        if "Margin".upper() in message_dict['message'].upper():
-            pass
-        if "DERIVAT".upper() in message_dict['message'].upper():
-            pass
-        if "CONTRACT".upper() in message_dict['message'].upper():
-            pass
-        elif (
-                "Delisting of".upper() in message_dict['message'].upper()):
-            arr_coins = self.get_blacklisted_coins(message_dict['message'])
-            if arr_coins is not []:
+        msg = message_dict['message'].upper()
+        if any(term in msg for term in ["CONTACT", "PERPETUAL", "MARGIN", "DERIVAT", "CONTRACT"]):
+            return message_dict
+
+        if "DELISTING OF" in msg:
+            arr_coins = self.read_message_text(message_dict)
+            if arr_coins:
                 message_dict['blacklisted_pairs'].extend(arr_coins)
+
         return message_dict
 
 
-class OkxScraper(BinanceScraper):
+class OkxScraper(TelegramScraper):
     def __init__(self):
         super().__init__()
+        self.coin_prefixes = []
+        self.coin_suffixes = []
+        self.exchange = "okx"
+        self.channel_username = "OKXAnnouncements"
 
-    coin_prefixes = []
-    coin_suffixes = []
-
-    exchange = "okx"
-    url = "https://t.me/s/OKXAnnouncements"
+    def prepare_message_dict(self, message):
+        return prepare_message_dict_template(self.exchange, message)
 
     def read_message(self, message_dict):
         if message_dict is None:
             return None
 
-        if "Contact".upper() in message_dict['message'].upper():
-            pass
-        elif "DERIVATIVE".upper() in message_dict['message'].upper():
-            pass
-        elif (
-                "Delisting of".upper() in message_dict['message'].upper()):
-            arr_coins = self.get_blacklisted_coins(message_dict['message'])
-            if arr_coins is not []:
+        msg = message_dict['message'].upper()
+        if "CONTACT" in msg or "DERIVATIVE" in msg:
+            return message_dict
+
+        if "DELISTING OF" in msg:
+            arr_coins = self.read_message_text(message_dict)
+            if arr_coins:
                 message_dict['blacklisted_pairs'].extend(arr_coins)
+
         return message_dict
 
 
-class GateioScraper(BinanceScraper):
+class GateioScraper(TelegramScraper):
     def __init__(self):
         super().__init__()
+        self.coin_suffixes = ["3L", "3S", "5L", "5S", "TOKEN", "PLATFORM"]
+        self.exchange = "gateio"
+        self.channel_username = "GateioOfficialNews"
 
-    coin_prefixes = []
-    coin_suffixes = ["3L", "3S", "5L", "5S", "TOKEN", "PLATFORM"]
-
-    exchange = "gateio"
-    url = "https://t.me/s/GateioOfficialNews"
-
-
+    def prepare_message_dict(self, message):
+        return prepare_message_dict_template(self.exchange, message)
 
     def read_message(self, message_dict):
         if message_dict is None:
             return None
 
-        if "Contact".upper() in message_dict['message'].upper():
-            pass
-        if "DERIVATIVE".upper() in message_dict['message'].upper():
-            pass
-        elif (
-                "Delist".upper() in message_dict['message'].upper()):
-            arr_coins = self.get_blacklisted_coins(message_dict['message'])
-            if arr_coins is not []:
+        msg = message_dict['message'].upper()
+        if "CONTACT" in msg or "DERIVATIVE" in msg:
+            return message_dict
+
+        if "DELIST" in msg:
+            arr_coins = self.read_message_text(message_dict)
+            if arr_coins:
                 message_dict['blacklisted_pairs'].extend(arr_coins)
+
         return message_dict
 
 
-class HtxScraper(BinanceScraper):
+class HtxScraper(TelegramScraper):
     def __init__(self):
         super().__init__()
+        self.coin_prefixes = []
+        self.coin_suffixes = ["1S", "2L", "2S", "3L", "3S", "2X"]
+        self.exchange = "htx"
+        self.channel_username = "htxglobalofficial"
 
-    coin_prefixes = []
-    coin_suffixes = ["1S", "2L", "2S", "3L", "3S", "2X"]
-
-    exchange = "htx"
-    url = "https://t.me/htxglobalofficial"
+    def prepare_message_dict(self, message):
+        return prepare_message_dict_template(self.exchange, message)
 
     def read_message(self, message_dict):
         if message_dict is None:
             return None
 
-        if "Contact".upper() in message_dict['message'].upper():
-            pass
-        if "DERIVATIVE".upper() in message_dict['message'].upper():
-            pass
-        elif (
-                "Delist".upper() in message_dict['message'].upper()):
-            arr_coins = self.get_blacklisted_coins(message_dict['message'])
-            if arr_coins is not []:
+        msg = message_dict['message'].upper()
+        if "CONTACT" in msg or "DERIVATIVE" in msg:
+            return message_dict
+
+        if "DELIST" in msg:
+            arr_coins = self.read_message_text(message_dict)
+            if arr_coins:
                 message_dict['blacklisted_pairs'].extend(arr_coins)
+
         return message_dict
-
-
-class KucoinScraperWeb(KucoinScraper):
-    def __init__(self):
-        super().__init__()
-
-    exchange = "kucoin_web"
-    url = "https://www.kucoin.com/announcement"
-
-    initialScrollUpTimes = 0
-    initialWaitSeconds = 5
-
-    message_bubble = "css-jwocck"
-    message_text = ["css-hr7j2u", "css-x0bekk"]
-    message_date = {"type": "p",
-                    "class": "css-121ce2o",
-                    "format": "%m/%d/%Y, %H:%M:%S"}
-
-    def extract_datetime(self, message_html):
-        if self.message_date['format'] == "":
-            return datetime(1970, 1, 1)  # Return a default datetime object
-        datetime_html = message_html.find(self.message_date['type'], class_=self.message_date['class'])
-        msg_datetime = datetime.strptime(datetime_html.contents[0], self.message_date['format'])
-        return msg_datetime
-
-
-class BinanceScraperWeb(BinanceScraper):
-    def __init__(self):
-        super().__init__()
-
-    exchange = "binance_web"
-    url = "https://www.binance.com/en/support/announcement/delisting?c=161"
-
-    initialScrollUpTimes = 0
-    initialWaitSeconds = 10
-
-    message_bubble = "css-1tl1y3y"
-    message_text = ["css-1yxx6id"]
-    message_date = {"type": "p",
-                    "class": "css-eoufru",
-                    "format": ""}
-
-    def extract_datetime(self, message_html):
-        if self.message_date['format'] == "":
-            return datetime(1970, 1, 1)  # Return a default datetime object
-        datetime_html = message_html.find(self.message_date['type'], class_=self.message_date['class'])
-        msg_datetime = datetime.strptime(datetime_html.contents[0], self.message_date['format'])
-        return msg_datetime
 
 
 def save_blacklist(exchange: str, new_blacklisted_pairs: []):
@@ -612,20 +611,51 @@ def save_blacklist(exchange: str, new_blacklisted_pairs: []):
                 rapidjson.dump(data, json_file, indent=4)
 
 
+# Shared prepare_message_dict to reuse across all classes
+def prepare_message_dict_template(exchange, message):
+    if not message.text:
+        return None
+
+    message_content = re.sub(r'[^\x00-\x7F]+', ' ', message.text)
+    message_content = re.sub(r'\s+', ' ', message_content).strip()
+    message_content = re.sub(r'(?i)(https://)', r' \1', message_content)
+    message_content = message_content.replace('"', "'")
+    message_content = remove_markdown_from_text(message_content)
+
+    if "www.kucoin.com/announcement/en-st-kucoin-will-delist-certain-projects #Announcement" in message_content:
+        pass
+
+    urls = [
+        url.strip("()[]<>'\",.*")
+        for url in re.findall(r'\bhttps://\S+', message_content, re.IGNORECASE)
+    ]
+
+    return {
+        "exchange": exchange,
+        "date": message.date.strftime(StatVars.datetimeFormat),
+        "date_scraped": datetime.now(timezone.utc).strftime(StatVars.datetimeFormat),
+        "message": message_content,
+        "linked_urls": urls,
+        "blacklisted_pairs": [],
+    }
+
+
 def open_processed():
     StatVars.logger.info("Loading local processed file")
-    try:
-        set_unique_identifiers()
-        # Read config from stdin if requested in the options
-        with Path(StatVars.path_processed_file).open() if StatVars.path_processed_file != '-' else sys.stdin as file:
-            StatVars.has_been_processed = rapidjson.load(file, parse_mode=StatVars.CONFIG_PARSE_MODE)
-        StatVars.unique_identifiers = set(
-            (entry["exchange"], entry["date"]) for entry in StatVars.has_been_processed)
-    except FileNotFoundError:
-        logging.error(f'Config file "{StatVars.path_processed_file}" not found!'
-                      ' Please create a config file or check whether it exists.')
-    except rapidjson.JSONDecodeError:
-        logging.error('Please verify your configuration file for syntax errors.')
+    #try:
+    set_unique_identifiers()
+    # Read config from stdin if requested in the options
+    with Path(StatVars.path_processed_file).open() if StatVars.path_processed_file != '-' else sys.stdin as file:
+        StatVars.has_been_processed = rapidjson.load(file, parse_mode=StatVars.CONFIG_PARSE_MODE)
+    StatVars.unique_identifiers = set(
+        (entry["exchange"], entry["date"]) for entry in StatVars.has_been_processed)
+    #except FileNotFoundError:
+
+
+#     logging.error(f'Config file "{StatVars.path_processed_file}" not found!'
+# ' Please create a config file or check whether it exists.')
+#except rapidjson.JSONDecodeError:
+#    logging.error('Please verify your configuration file for syntax errors.')
 
 
 def save_processed():
@@ -783,141 +813,67 @@ def get_exchanges_from_bot_groups():
     return exchanges
 
 
-def refresh_ccxt_exchange_pairs(exchanges_pairs):
-    with ThreadPoolExecutor() as executor:
-        futures = {executor.submit(get_exchange_pairs, exchange): exchange for exchange in exchanges_pairs.keys()}
-        for future in concurrent.futures.as_completed(futures):
-            exchange = futures[future]
-            exchanges_pairs[exchange] = future.result()
-
-
 def handle_exception(ex1):
-    try:
-        StatVars.driver.quit()
-    except Exception as ex3:
-        logging.error(f"an error occurred: {ex3}")
-    try:
-        StatVars.driver = set_driver()
-    except Exception as ex2:
-        logging.error(f"an error occurred: {ex2}")
-    logging.error(f"An error occurred: {ex1}")
+    #try:
+    StatVars.driver.quit()
+    #except Exception as ex3:
+    #    logging.error(f"an error occurred: {ex3}")
+    #try:
+    # StatVars.driver = set_driver()
+    #    pass
+    #except Exception as ex2:
+    #    logging.error(f"an error occurred: {ex2}")
+    #logging.error(f"An error occurred: {ex1}")
     time.sleep(30)  # an error happened, could be anything ... even being rate limited ... Take a nap bot!
 
 
 def main():
-    StatVars.driver = set_driver()
-    # make the script not gobble up resources
+    get_exchange_pairs("kucoin")
     os.nice(15)
     open_processed()
     load_bots_data()
+    init_telethon()
 
     exchanges_to_loop_through = get_exchanges_from_bot_groups()
     check_all_bots()
-    # test force-enter and force exits
-    # StatVars.bot_groups[0]['new_pair_blacklist'].append("BTC/USDT:USDT")
-    # StatVars.bot_groups[0]['new_pair_blacklist'].append("ETH/USDT:USDT")
-    # StatVars.bot_groups[0]['new_pair_blacklist'].append("SOL/USDT:USDT")
-    # send_force_exit_long()
-    # send_force_enter_short()
-    # send_blacklists()
 
-    heartbeat_time_pairs = datetime.min
-    heartbeat_time = datetime.min  # will push a heartbeat out instantly
-    exchanges = ['binance', 'kucoin', 'bybit', 'okx', 'gateio', 'htx']
-    exchanges_pairs = {exchange: {} for exchange in exchanges}  # Initialize as empty dictionaries
+    heartbeat_time_pairs = datetime.now()
+    heartbeat_time = datetime.min.now()
+
+    scrapers = {
+        'binance': BinanceScraper(),
+        'kucoin': KucoinScraper(),
+        'bybit': BybitScraper(),
+        'okx': OkxScraper(),
+        'gateio': GateioScraper(),
+        'htx': HtxScraper()
+    }
 
     while True:
-        try:
-            StatVars.blacklist_changed = False
+        #try:
+        if datetime.now() - heartbeat_time_pairs >= timedelta(hours=24):
+            heartbeat_time_pairs = datetime.now()
 
-            # Only rescan if the minute is not modulo 5 == 0
-            # This is done to avoid any potential conflicts with query weights for any timeframe >=5m
-            if datetime.now() - heartbeat_time_pairs >= timedelta(hours=24) and datetime.now().minute % 5 > 0:
-                refresh_ccxt_exchange_pairs(exchanges_pairs)
-                heartbeat_time_pairs = datetime.now()
+        start_time = time.monotonic()
 
-            # Even if the previous condition triggered, still run through it on startup
-            elif all(not exchange_pairs for exchange_pairs in exchanges_pairs.values()):
-                logging.info(f"waiting 1 minute, start time is at {datetime.now().minute} % 5 == 0 "
-                             f"(to avoid potential issues with query weights)")
-                time.sleep(60)
-                refresh_ccxt_exchange_pairs(exchanges_pairs)
-                heartbeat_time_pairs = datetime.now()
-                StatVars.driver.quit()
-                StatVars.driver = set_driver()
+        # Run all scrapers sequentially
+        for exchange_name, scraper in scrapers.items():
+            if exchange_name.lower() in exchanges_to_loop_through:
+                scraper.scrape()
 
-            start_time = time.monotonic()
-        except Exception as ex1:
-            handle_exception(ex1)
+        if datetime.now() - heartbeat_time >= timedelta(minutes=15):
+            logging.info("delist-scraper heartbeat")
+            heartbeat_time = datetime.now()
 
-        try:
-            current_exchange = "binance"
-            if current_exchange.lower() in exchanges_to_loop_through:
-                current_instance = BinanceScraper()
-                current_instance.scrape(exchanges_pairs[current_exchange])
-        except Exception as ex1:
-            handle_exception(ex1)
+        time_to_sleep_left = StatVars.loop_secs - ((time.monotonic() - start_time) % StatVars.loop_secs)
+        logging.debug(f"for this loop we still have to wait for {time_to_sleep_left} seconds")
 
-        try:
-            current_exchange = "bybit"
-            if current_exchange.lower() in exchanges_to_loop_through:
-                current_instance = BybitScraper()
-                current_instance.scrape(exchanges_pairs[current_exchange])
-        except Exception as ex1:
-            handle_exception(ex1)
+        time.sleep(StatVars.loop_secs - ((time.monotonic() - start_time) % StatVars.loop_secs))
 
-        try:
-            current_exchange = "okx"
-            if current_exchange.lower() in exchanges_to_loop_through:
-                current_instance = OkxScraper()
-                current_instance.scrape(exchanges_pairs[current_exchange])
-        except Exception as ex1:
-            handle_exception(ex1)
+        #except Exception as ex:
+        #    logging.error(f"An error occurred: {ex}")
+        #    time.sleep(30)
 
-        try:
-            current_exchange = "gateio"
-            if current_exchange.lower() in exchanges_to_loop_through:
-                current_instance = GateioScraper()
-                current_instance.scrape(exchanges_pairs[current_exchange])
-        except Exception as ex1:
-            handle_exception(ex1)
-
-        # HTX stopped working have to change the URL.
-        '''
-        try:
-            current_exchange = "htx"
-            if current_exchange.lower() in exchanges_to_loop_through:
-                current_instance = HtxScraper()
-                current_instance.scrape(exchanges_pairs[current_exchange])
-                del current_instance
-        except Exception as ex1:
-            handle_exception(ex1)
-        '''
-        try:
-            current_exchange = "kucoin"
-            if current_exchange.lower() in exchanges_to_loop_through:
-                current_instance = KucoinScraper()
-                current_instance.scrape(exchanges_pairs[current_exchange])
-        except Exception as ex1:
-            handle_exception(ex1)
-
-        try:
-            if datetime.now() - heartbeat_time >= timedelta(minutes=15):
-                # Execute heartbeat action
-                logging.info("delist-scraper heartbeat")
-
-                # Update heartbeat time
-                heartbeat_time = datetime.now()
-
-            # duration_rounded = round((time.monotonic() - loop_start_time), 2)
-            # logging.info(f"This loop took {duration_rounded} seconds")
-            time_to_sleep_left = StatVars.loop_secs - ((time.monotonic() - start_time) % StatVars.loop_secs)
-            logging.debug(f"for this loop we still have to wait for {time_to_sleep_left} seconds")
-
-            time.sleep(StatVars.loop_secs - ((time.monotonic() - start_time) % StatVars.loop_secs))
-            # logging.info("looped once successfully")
-        except Exception as ex1:
-            handle_exception(ex1)
         gc.collect()
 
 

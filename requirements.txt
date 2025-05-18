@@ -8,3 +8,4 @@ tqdm
 ccxt
 freqtrade_client
 tqdm
+telethon
