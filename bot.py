@@ -1,9 +1,13 @@
+import concurrent.futures
+import fnmatch
 import gc
 import logging
 import os
 import re
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
+
 import unicodedata
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -11,6 +15,7 @@ from pathlib import Path
 import ccxt
 import freqtrade_client
 import rapidjson
+
 # import telethon
 from bs4 import BeautifulSoup
 from selenium import webdriver
@@ -133,29 +138,28 @@ def report_to_be_processed():
 def get_exchange_pairs(exchange_name):
     sleep_timer_on_error = 60
     while True:
-        #try:
-        exchange_class = getattr(ccxt, exchange_name)
-        exchange = exchange_class({
-            'timeout': 30000,
-            'enableRateLimit': True,
-            'rateLimit': 500,  # don't even try to endanger any potential bots by spamming the exchange
-        })
-        # Get available markets on exchange
-        markets = exchange.load_markets()
+        try:
+            exchange_class = getattr(ccxt, exchange_name)
+            exchange = exchange_class({
+                'timeout': 30000,
+                'enableRateLimit': True,
+                'rateLimit': 500,  # don't even try to endanger any potential bots by spamming the exchange
+            })
+            # Get available markets on exchange
+            markets = exchange.load_markets()
+            if markets:
+                logging.info(f"Refreshing pairs for exchange {exchange}, we found {len(markets)} pairs.")
+                return markets
+            else:
+                logging.info(f"No markets available for {exchange_name}. Retrying after {sleep_timer_on_error}s ...")
+                time.sleep(sleep_timer_on_error)
+        except Exception as e:
+            logging.info(f"Error fetching markets for {exchange_name}: {e}. Retrying after {sleep_timer_on_error}s ...")
 
-        #if any("GFT" in key.upper() for key in markets.keys()):
-        #    print("GFT is present in the market pairs.")
-        #else:
-        #    print("GFT is not present in the market pairs.")
 
-        if markets:
-            logging.info(f"We found {len(markets)} pairs for the Exchange {exchange}.")
-            return markets
-        else:
-            logging.info(f"No markets available for {exchange_name}. Retrying after {sleep_timer_on_error}s ...")
-            time.sleep(sleep_timer_on_error)
-        #except Exception as e:
-        #    logging.info(f"Error fetching markets for {exchange_name}: {e}. Retrying after {sleep_timer_on_error}s ...")
+def get_unique_identifier(message_dict):
+    unique_identifier = (message_dict.get("exchange"), message_dict.get("date"))
+    return unique_identifier
 
 
 def get_unique_identifier(message_dict):
@@ -184,8 +188,10 @@ class TelegramScraper:
         self.sleep_secs_at_error = 60
         self.delist_website = ""
         self.previously_found_messages = 0
+        self.pairs = {}
 
-    def scrape(self):
+    def scrape(self, pairs):
+        self.pairs = pairs
         # try:
         telegram_channel = StatVars.telethon_client.get_entity(self.channel_username)
         while not self.found_processed:
@@ -285,6 +291,60 @@ class TelegramScraper:
     def read_web_message(self, dict_message):
         raise "This method is not initialized in the main class itself, please use it in the derived classes."
 
+    # This was changed to specifically looking for prefixes since a pair W and T was blacklisted, which would
+    # blacklist all pairs ending on a T or W which ... sucks
+    def get_blacklisted_coins(self, message_dict: {}):
+        modified_message = (message_dict['message'].upper()
+                            .replace("and".upper(), " ")
+                            .replace("&".upper(), " ")
+                            .replace(",", " ")
+                            .replace(".", " ")
+                            .replace("(", " ")
+                            .replace(")", " ")
+                            .replace("$", " ")
+                            .strip()
+                            )
+
+        # make splitting things easier by removing double spaces
+        # (not strictly necessary but hey, ease of debugging > all)
+        while "  " in modified_message:
+            modified_message = modified_message.replace("  ", " ")
+
+        set_title = set(modified_message.strip().split(" "))
+        set_title_no_trailing_slash = [word.split('/')[0] for word in set_title]
+
+        # prepare variables
+        all_coins = {pair['id'].upper().replace("-", "") for pair in self.pairs.values()}
+        all_coins.update({pair['base'].upper() for pair in self.pairs.values()})
+
+        # Use list comprehension to build the set of coins directly
+        set_coins = {coin for coin in set_title_no_trailing_slash if coin.upper() in all_coins}
+
+        caught_coins = set(message_dict['blacklisted_pairs'])
+        for set_coin in set_coins:
+            # Add the coin itself without any prefix or suffix
+            pattern_coin_itself = f"{set_coin}/.*"
+            caught_coins.add(pattern_coin_itself)
+
+            # Check all combinations of prefixes and suffixes
+            for prefix in self.coin_prefixes:
+                for suffix in self.coin_suffixes:
+                    # Construct potential coin combinations
+                    potential_coin_combo = f"{prefix}{set_coin}{suffix}".upper()
+                    potential_coin_prefix = f"{prefix}{set_coin}".upper()
+                    potential_coin_suffix = f"{set_coin}{suffix}".upper()
+
+                    # Check if any of these patterns match 'base' values in self.pairs
+                    for pair_key, pair_value in self.pairs.items():
+                        if 'base' in pair_value:
+                            base_value = pair_value['base'].upper()
+                            if (fnmatch.fnmatch(base_value, potential_coin_combo) or
+                                    fnmatch.fnmatch(base_value, potential_coin_prefix) or
+                                    fnmatch.fnmatch(base_value, potential_coin_suffix)):
+                                caught_coins.add(base_value)
+        message_dict['blacklisted_pairs'] = list(caught_coins)
+        return message_dict
+
 
 class BinanceScraper(TelegramScraper):
     def __init__(self):
@@ -312,7 +372,8 @@ class BinanceScraper(TelegramScraper):
             r"suspension of .* deposits",
             r"Notice on the Withdrawals of",
             r"from Cross and Isolated Margin",
-            r"Binance Margin & Binance Futures Will Delist BUSD"
+            r"Binance Margin & Binance Futures Will Delist BUSD",
+            r"Will Support .* Buyback"
         ]
 
         # Debug steps, leaving this in so it s quicker to debug.
@@ -323,31 +384,9 @@ class BinanceScraper(TelegramScraper):
             pass  # return the message_dict without looking into blacklisted pairs
         # Check for delisting
         elif any(re.search(pattern, message_dict['message'], re.IGNORECASE) for pattern in delist_patterns):
-            arr_coins = self.read_message_text(message_dict)
-            if arr_coins:
-                message_dict['blacklisted_pairs'].extend(arr_coins)
-                StatVars.logger.info(f"Found delisting announcement for {self.exchange}: {arr_coins}")
+            message_dict = self.get_blacklisted_coins(message_dict)
 
         return message_dict
-
-    def read_message_text(self, message_dict):
-
-        patterns = [
-            re.compile(r"^binance will delist\s+([A-Z0-9,\sand]+?)\s+(on|\(|by)", re.IGNORECASE),
-            # You can add more patterns here if needed
-            # re.compile(r"...")
-        ]
-
-        for pattern in patterns:
-            match = pattern.search(message_dict['message'])
-            if match:
-                raw_list = match.group(1)
-                # Split by comma or 'and' with ignorecase
-                delisted_coins = [coin.strip() for coin in re.split(r",|\band\b", raw_list, flags=re.IGNORECASE)]
-                logging.info(f"Delisted coins extracted: {delisted_coins}")
-                return set(delisted_coins)
-
-        return set()
 
 
 class KucoinScraper(TelegramScraper):
@@ -370,7 +409,7 @@ class KucoinScraper(TelegramScraper):
         web_scraper_patterns = [
             "Delist .*Certain Project",
             # "KuCoin Will Delist Certain Projects",
-            "KuCoin .*Delist.* Projects"
+            "KuCoin .*Delist.* Project"
         ]
 
         reject_patterns = [
@@ -386,14 +425,17 @@ class KucoinScraper(TelegramScraper):
             "contract",
             "KuCoin Convert",
             "KuCoin Will Launch",
-            "Sandbox mode"
+            "Sandbox Mode",
+            "Earn Trade",
+            "referral program"
         ]
 
         # first we deny anything without the word "delist" in it
-        if "delist" not in message_dict['message']:
+        if not any(re.search(pattern, message_dict['message'], re.IGNORECASE) for pattern in delist_patterns):
             return message_dict
 
-        # then all those contracts etc, we just want full removals not any fringe /BUSD pairs etc triggering a blacklist
+        # then all those contracts etc.,
+        # we just want full removals not any fringe /BUSD pairs etc. triggering a blacklist
         if any(re.search(pattern, message_dict['message'], re.IGNORECASE) for pattern in reject_patterns):
             return message_dict  # return the message_dict without looking into blacklisted pairs
 
@@ -404,37 +446,14 @@ class KucoinScraper(TelegramScraper):
         if any(re.search(pattern, message_dict['message'], re.IGNORECASE) for pattern in web_scraper_patterns):
             message_dict = self.read_web_message(message_dict)
 
-        if any(re.search(pattern, message_dict['message'], re.IGNORECASE) for pattern in delist_patterns):
-            message_dict = self.read_message_text(message_dict)
-
+        message_dict = self.get_blacklisted_coins(message_dict)
         if len(message_dict['blacklisted_pairs']) == 0:
             logging.info("Uh oh we didnt find any pairs with the scraping? Time to debug what's going on !!")
         return message_dict
 
-    def read_message_text(self, message_dict):
-        patterns = [
-            re.compile(r'\(([A-Z0-9]+)\)\s+Token', re.IGNORECASE),  # original
-            re.compile(r'delist\s+the\s+([A-Z0-9]+)\s+Project', re.IGNORECASE),  # new pattern
-        ]
-        found_token = False
-        tokens_found_here = []
-        for pattern in patterns:
-            match = pattern.search(message_dict['message'])
-            if match:
-                found_token = True
-                token = match.group(1).upper()
-
-                message_dict['blacklisted_pairs'].append(token)
-                tokens_found_here.append(token)
-        if found_token:
-            logging.info(f"read_message_text: Delisted token: {tokens_found_here} "
-                         f"from text {message_dict['message']}")
-        return message_dict
 
     def read_web_message(self, message_dict):
         for url in message_dict['linked_urls']:
-            if "202306009" in url:
-                pass
             if "https://www.kucoin.com/announcement" not in url.lower() and "https://www.kucoin.com/news" not in url.lower():
                 continue
 
@@ -463,17 +482,11 @@ class KucoinScraper(TelegramScraper):
             if article_div:
                 article_text = article_div.get_text()
                 text = remove_markdown_from_text(article_text)
-                if text:
-                    message_dict['message'] += f" || {url}: {text}"
+                text = text.replace('(', ' (').replace(')', ') ')
 
-                    # Extract coin symbols enclosed in parentheses, excluding certain terms
-                    arr_coins = re.findall(r'\(\s*(?!UTC|GMT|Twitter)([A-Z0-9]+)\s*\)', text, flags=re.IGNORECASE)
-
-                    message_dict['blacklisted_pairs'].extend(arr_coins)
+                message_dict['message'] = message_dict['message'] + " | " + text
             else:
                 logging.warning(f"Article content not found at {url}")
-        if len(message_dict['blacklisted_pairs']) == 0:
-            pass
         return message_dict
 
 
@@ -813,6 +826,14 @@ def get_exchanges_from_bot_groups():
     return exchanges
 
 
+def refresh_ccxt_exchange_pairs(exchanges_pairs):
+    with ThreadPoolExecutor() as executor:
+        futures = {executor.submit(get_exchange_pairs, exchange): exchange for exchange in exchanges_pairs.keys()}
+        for future in concurrent.futures.as_completed(futures):
+            exchange = futures[future]
+            exchanges_pairs[exchange] = future.result()
+
+
 def handle_exception(ex1):
     #try:
     StatVars.driver.quit()
@@ -828,7 +849,6 @@ def handle_exception(ex1):
 
 
 def main():
-    get_exchange_pairs("kucoin")
     os.nice(15)
     open_processed()
     load_bots_data()
@@ -837,10 +857,10 @@ def main():
     exchanges_to_loop_through = get_exchanges_from_bot_groups()
     check_all_bots()
 
-    heartbeat_time_pairs = datetime.now()
-    heartbeat_time = datetime.min.now()
+    heartbeat_time_pairs = datetime.min
+    heartbeat_time = datetime.min
 
-    scrapers = {
+    exchanges = {
         'binance': BinanceScraper(),
         'kucoin': KucoinScraper(),
         'bybit': BybitScraper(),
@@ -848,18 +868,41 @@ def main():
         'gateio': GateioScraper(),
         'htx': HtxScraper()
     }
+    exchanges_pairs = {exchange: {} for exchange in exchanges}  # Initialize as empty dictionaries
 
     while True:
-        #try:
+        try:
+            StatVars.blacklist_changed = False
+
+            # Only rescan if the minute is not modulo 5 == 0
+            # This is done to avoid any potential conflicts with query weights for any timeframe >=5m
+            if datetime.now() - heartbeat_time_pairs >= timedelta(hours=24) and datetime.now().minute % 5 > 0:
+                refresh_ccxt_exchange_pairs(exchanges_pairs)
+                heartbeat_time_pairs = datetime.now()
+
+            # Even if the previous condition triggered, still run through it on startup
+            elif all(not exchange_pairs for exchange_pairs in exchanges_pairs.values()):
+                logging.info(f"waiting 1 minute, start time is at {datetime.now().minute} % 5 == 0 "
+                             f"(to avoid potential issues with query weights)")
+                time.sleep(60)
+                refresh_ccxt_exchange_pairs(exchanges_pairs)
+                heartbeat_time_pairs = datetime.now()
+                StatVars.driver.quit()
+                StatVars.driver = set_driver()
+
+            start_time = time.monotonic()
+        except Exception as ex1:
+            handle_exception(ex1)
+
         if datetime.now() - heartbeat_time_pairs >= timedelta(hours=24):
             heartbeat_time_pairs = datetime.now()
 
         start_time = time.monotonic()
 
         # Run all scrapers sequentially
-        for exchange_name, scraper in scrapers.items():
+        for exchange_name, scraper in exchanges.items():
             if exchange_name.lower() in exchanges_to_loop_through:
-                scraper.scrape()
+                scraper.scrape(exchanges_pairs[exchange_name])
 
         if datetime.now() - heartbeat_time >= timedelta(minutes=15):
             logging.info("delist-scraper heartbeat")
