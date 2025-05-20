@@ -510,11 +510,10 @@ class BybitScraper(TelegramScraper):
             return message_dict
 
         if "DELISTING OF" in msg:
-            arr_coins = self.read_message_text(message_dict)
-            if arr_coins:
-                message_dict['blacklisted_pairs'].extend(arr_coins)
+            message_dict = self.get_blacklisted_coins(message_dict)
 
         return message_dict
+
 
 
 class OkxScraper(TelegramScraper):
@@ -537,9 +536,7 @@ class OkxScraper(TelegramScraper):
             return message_dict
 
         if "DELISTING OF" in msg:
-            arr_coins = self.read_message_text(message_dict)
-            if arr_coins:
-                message_dict['blacklisted_pairs'].extend(arr_coins)
+            message_dict = self.get_blacklisted_coins(message_dict)
 
         return message_dict
 
@@ -563,9 +560,7 @@ class GateioScraper(TelegramScraper):
             return message_dict
 
         if "DELIST" in msg:
-            arr_coins = self.read_message_text(message_dict)
-            if arr_coins:
-                message_dict['blacklisted_pairs'].extend(arr_coins)
+            message_dict = self.get_blacklisted_coins(message_dict)
 
         return message_dict
 
@@ -590,9 +585,7 @@ class HtxScraper(TelegramScraper):
             return message_dict
 
         if "DELIST" in msg:
-            arr_coins = self.read_message_text(message_dict)
-            if arr_coins:
-                message_dict['blacklisted_pairs'].extend(arr_coins)
+            message_dict = self.get_blacklisted_coins(message_dict)
 
         return message_dict
 
