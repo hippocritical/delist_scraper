@@ -55,7 +55,7 @@ class StatVars:
     bot_groups = []
     datetimeFormat = '%Y-%m-%dT%H:%M:%S%z'
 
-    loop_secs = 30
+    loop_secs = 10
 
     logging.basicConfig(
         level=logging.INFO,
@@ -77,8 +77,19 @@ class StatVars:
 
 async def set_playwright():
     logging.info("Starting Playwright browser")
-    playwright = await async_playwright().start()
-    browser = await playwright.firefox.launch(headless=True)
+
+    # Clean up previous instance if it exists
+    if hasattr(StatVars, "playwright_instance") and StatVars.playwright_instance:
+        logging.info("Closing previous Playwright instance")
+        try:
+            await StatVars.playwright_instance.stop()
+        except Exception as e:
+            logging.warning(f"Error while stopping existing Playwright instance: {e}")
+        StatVars.playwright_instance = None
+
+    # Start new instance
+    StatVars.playwright_instance = await async_playwright().start()
+    browser = await StatVars.playwright_instance.firefox.launch(headless=True)
     context = await browser.new_context(
         accept_downloads=False,
         ignore_https_errors=True,
@@ -89,7 +100,7 @@ async def set_playwright():
     return page
 
 
-async def init_telethon():  # Made async
+async def init_telethon():
     with open('telegram_config.json') as f:
         StatVars.telegram_config = rapidjson.load(f)
 
@@ -847,7 +858,7 @@ async def handle_exception(ex1):
     #    logging.error(f"an error occurred during cleanup: {ex3}")
 
     #try:
-    StatVars.page = await set_playwright()
+    await set_playwright()
     #except Exception as ex2:
     #    logging.error(f"an error occurred during playwright setup: {ex2}")
 
@@ -878,7 +889,8 @@ async def main():
     exchanges_pairs = {exchange: {} for exchange in exchanges}  # Initialize as empty dictionaries
 
     # Initial refresh at startup
-    StatVars.page = await set_playwright()
+    await set_playwright()
+
     heartbeat_time_pairs = datetime.now()
 
     # Optional: delay startup if it's right on a 5-minute boundary
@@ -897,7 +909,7 @@ async def main():
                 await asyncio.to_thread(refresh_ccxt_exchange_pairs, exchanges_pairs)
                 heartbeat_time_pairs = now
 
-                StatVars.driver = await set_playwright()
+                await set_playwright()
             else:
                 logging.info("24h refresh skipped to avoid 5-minute divisible minute. Will retry next iteration.")
 
