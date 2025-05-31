@@ -1,3 +1,4 @@
+import asyncio
 import concurrent.futures
 import fnmatch
 import gc
@@ -12,18 +13,13 @@ import unicodedata
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import playwright.async_api
+from telethon import TelegramClient
+from playwright.async_api import async_playwright
+
 import ccxt
 import freqtrade_client
 import rapidjson
-
-# import telethon
-from bs4 import BeautifulSoup
-from selenium import webdriver
-from selenium.webdriver.common.by import By
-from selenium.webdriver.firefox.service import Service as FirefoxService
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.webdriver.support.ui import WebDriverWait
-from telethon.sync import TelegramClient  # Sync-compatible client
 
 
 # Some exchanges use non-normalized letters which can throw off the comparison and finding of those pairs.
@@ -73,60 +69,40 @@ class StatVars:
     # Add Telethon session file path
     session_file = 'telegram.session'
 
-    driver = None
+    playwright = None
+    browser = None
+    context = None
+    page = None
 
 
-def set_driver():
-    logging.info("starting driver for browser")
-    # Set up Firefox options
-    options = webdriver.FirefoxOptions()
-    options.add_argument("--headless")
-    # options.add_argument("--no-sandbox")
-    # options.add_argument("--disable-dev-shm-usage")
-    options.set_preference("intl.accept_languages", "en")
-    options.set_preference("permissions.default.image", 2)  # Disable loading images
-    # options.add_argument("--single-process")
-    options.add_argument("--disable-crash-reporter")
-    options.add_argument("--disable-infobars")
-
-    # Specify the path to the manually installed geckodriver
-    geckodriver_path = "/usr/local/bin/geckodriver"
-    service = FirefoxService(executable_path=geckodriver_path)
-
-    # Initialize Firefox WebDriver with the specified options and service
-    # logging.info("Initializing Firefox WebDriver")
-    driver = webdriver.Firefox(service=service, options=options)
-
-    # Set timeouts
-    driver.set_page_load_timeout(120)  # Set the page load timeout to 60 seconds
-    driver.implicitly_wait(120)  # Set the implicit wait timeout to 60 seconds
-
-    # logging.info("Firefox WebDriver initialized successfully")
-    return driver
+async def set_playwright():
+    logging.info("Starting Playwright browser")
+    playwright = await async_playwright().start()
+    browser = await playwright.firefox.launch(headless=True)
+    context = await browser.new_context(
+        accept_downloads=False,
+        ignore_https_errors=True,
+        java_script_enabled=True,
+        locale="en-US",
+    )
+    page = await context.new_page()
+    return page
 
 
-def init_telethon():
-    """Initialize Telethon client"""
-    #try:
-    # Load Telethon config
+async def init_telethon():  # Made async
     with open('telegram_config.json') as f:
         StatVars.telegram_config = rapidjson.load(f)
 
     StatVars.telethon_client = TelegramClient(
-        StatVars.session_file,  # Use your session_file variable
+        StatVars.session_file,
         StatVars.telegram_config['api_id'],
         StatVars.telegram_config['api_hash'],
-        # the code is sync to not run into api limits, but hey ... better safe than sorry
         flood_sleep_threshold=10,
         request_retries=3,
         retry_delay=5
     )
 
-    StatVars.telethon_client.start(phone=StatVars.telegram_config['phone_number'])
-
-    #except Exception as e:
-    #    logging.error(f"Failed to initialize Telethon: {e}")
-    #    raise
+    await StatVars.telethon_client.start(phone=StatVars.telegram_config['phone_number'])
 
 
 def report_to_be_processed():
@@ -155,11 +131,7 @@ def get_exchange_pairs(exchange_name):
                 time.sleep(sleep_timer_on_error)
         except Exception as e:
             logging.info(f"Error fetching markets for {exchange_name}: {e}. Retrying after {sleep_timer_on_error}s ...")
-
-
-def get_unique_identifier(message_dict):
-    unique_identifier = (message_dict.get("exchange"), message_dict.get("date"))
-    return unique_identifier
+            time.sleep(sleep_timer_on_error)
 
 
 def get_unique_identifier(message_dict):
@@ -190,17 +162,18 @@ class TelegramScraper:
         self.previously_found_messages = 0
         self.pairs = {}
 
-    def scrape(self, pairs):
+    async def scrape(self, pairs):
         self.pairs = pairs
-        # try:
-        telegram_channel = StatVars.telethon_client.get_entity(self.channel_username)
+        telegram_channel = await StatVars.telethon_client.get_entity(self.channel_username)
+
         while not self.found_processed:
             if len(StatVars.to_be_processed) > 0:
-                logging.info(f"Found {len(StatVars.to_be_processed)} messages in {self.channel_username} "
-                             f"that weren't registered. Asking for more!")
-                time.sleep(
-                    self.sleep_secs_between_queries)  # 1 sec sleep to not hit api limits, better safe than sorry.
-            messages = StatVars.telethon_client.get_messages(
+                logging.info(
+                    f"Found {len(StatVars.to_be_processed)} messages in {self.channel_username} "
+                    f"that weren't registered. Asking for more!")
+                time.sleep(self.sleep_secs_between_queries)
+
+            messages = await StatVars.telethon_client.get_messages(
                 telegram_channel,
                 limit=self.message_limit,
                 offset_id=self.offset_id
@@ -213,7 +186,7 @@ class TelegramScraper:
                 self.offset_id = message.id  # update for next batch
 
                 prepared_message_dict = prepare_message_dict_template(self.exchange, message)
-                message_dict = self.read_message(prepared_message_dict)
+                message_dict = await self.read_message(prepared_message_dict)
 
                 if not message_dict or message_dict['message'] == "":
                     continue
@@ -285,10 +258,10 @@ class TelegramScraper:
 
         return messages, len_messages, stop_loop
 
-    def read_message(self, prepared_message_dict):
+    async def read_message(self, prepared_message_dict):
         raise "This method is not initialized in the main class itself, please use it in the derived classes."
 
-    def read_web_message(self, dict_message):
+    async def read_web_message(self, dict_message):
         raise "This method is not initialized in the main class itself, please use it in the derived classes."
 
     # This was changed to specifically looking for prefixes since a pair W and T was blacklisted, which would
@@ -355,7 +328,7 @@ class BinanceScraper(TelegramScraper):
         self.coin_suffixes = ["DOWN", "UP", "BEAR", "BULL"]
         self.delist_website = ""
 
-    def read_message(self, message_dict):
+    async def read_message(self, message_dict):
         if not message_dict:
             return None
 
@@ -374,6 +347,7 @@ class BinanceScraper(TelegramScraper):
             r"from Cross and Isolated Margin",
             r"Binance Margin & Binance Futures Will Delist BUSD",
             r"Will Support .* Buyback"
+            r"Binance Margin"
         ]
 
         # Debug steps, leaving this in so it s quicker to debug.
@@ -396,9 +370,8 @@ class KucoinScraper(TelegramScraper):
         self.channel_username = "Kucoin_News"
         self.coin_prefixes = ["000"]
         self.coin_suffixes = ["2L", "2S", "3L", "3S", "DOWN", "UP"]
-        StatVars.driver = set_driver()
 
-    def read_message(self, message_dict):
+    async def read_message(self, message_dict):
         if not message_dict:
             return None
 
@@ -444,49 +417,48 @@ class KucoinScraper(TelegramScraper):
             pass  # return the message_dict without looking into blacklisted pairs
 
         if any(re.search(pattern, message_dict['message'], re.IGNORECASE) for pattern in web_scraper_patterns):
-            message_dict = self.read_web_message(message_dict)
+            message_dict = await self.read_web_message(message_dict)
 
         message_dict = self.get_blacklisted_coins(message_dict)
         if len(message_dict['blacklisted_pairs']) == 0:
-            logging.info("Uh oh we didnt find any pairs with the scraping? Time to debug what's going on !!")
+            logging.info("A news post that stated 'delist' didnt turn up any delisted pair. "
+                         "The most likely case is that ccxt does not get that mentioned pair anymore "
+                         "and you can't download that pair anymore either.")
         return message_dict
 
-
-    def read_web_message(self, message_dict):
+    async def read_web_message(self, message_dict):
         for url in message_dict['linked_urls']:
             if "https://www.kucoin.com/announcement" not in url.lower() and "https://www.kucoin.com/news" not in url.lower():
                 continue
 
-            StatVars.driver.get(url)
+            success = False
+            for attempt in range(3):  # Try up to 2 times
+                try:
+                    await StatVars.page.goto(url, timeout=10000)
 
-            try:
-                # Wait until the div is there ... or 10s
-                WebDriverWait(StatVars.driver, 10).until(
-                    EC.presence_of_element_located((By.CLASS_NAME, "kucoin-article_oXGwp"))
-                )
+                    # Sometimes the website is unable to load the actual news.
+                    try:
+                        await StatVars.page.wait_for_selector(".kucoin-article_oXGwp", state="visible", timeout=10000)
+                    except playwright.async_api.Error:
+                        logging.warning(f"[Attempt {attempt + 1}] Timeout waiting for selector on {url}")
+                        continue  # Try again if this was the first attempt
 
-                # Additional wait until the article's text content is non-empty ... or 10s
-                WebDriverWait(StatVars.driver, 10).until(
-                    lambda driver: driver.find_element(By.CLASS_NAME, "kucoin-article_oXGwp").text.strip() != ""
-                )
-                time.sleep(1)  # additional time waiting since STILL it wont sometimes work properly ...
-            except Exception as e:
-                logging.warning(f"Timeout waiting for article content at {url}: {e}")
-                continue
+                    article_text = await StatVars.page.inner_text(".kucoin-article_oXGwp")
+                    if article_text:
+                        text = remove_markdown_from_text(article_text)
+                        text = text.replace('(', ' (').replace(')', ') ')
+                        message_dict['message'] += " | " + text
+                        success = True
+                        break
+                    else:
+                        logging.warning(f"[Attempt {attempt + 1}] Article content not found at {url}")
+                except Exception as e:
+                    logging.error(f"[Attempt {attempt + 1}] Error retrieving content from {url}: {e}")
 
-            # Parse the page source with BeautifulSoup
-            html_source = StatVars.driver.page_source
-            soup = BeautifulSoup(html_source, "html.parser")
+            if not success:
+                logging.warning(f"Failed to retrieve content from {url} after 2 attempts.")
+                return message_dict  # Return after all attempts fail
 
-            article_div = soup.find("div", class_="kucoin-article_oXGwp")
-            if article_div:
-                article_text = article_div.get_text()
-                text = remove_markdown_from_text(article_text)
-                text = text.replace('(', ' (').replace(')', ') ')
-
-                message_dict['message'] = message_dict['message'] + " | " + text
-            else:
-                logging.warning(f"Article content not found at {url}")
         return message_dict
 
 
@@ -501,7 +473,7 @@ class BybitScraper(TelegramScraper):
     def prepare_message_dict(self, message):
         return prepare_message_dict_template(self.exchange, message)
 
-    def read_message(self, message_dict):
+    async def read_message(self, message_dict):
         if message_dict is None:
             return None
 
@@ -515,7 +487,6 @@ class BybitScraper(TelegramScraper):
         return message_dict
 
 
-
 class OkxScraper(TelegramScraper):
     def __init__(self):
         super().__init__()
@@ -527,7 +498,7 @@ class OkxScraper(TelegramScraper):
     def prepare_message_dict(self, message):
         return prepare_message_dict_template(self.exchange, message)
 
-    def read_message(self, message_dict):
+    async def read_message(self, message_dict):
         if message_dict is None:
             return None
 
@@ -551,7 +522,7 @@ class GateioScraper(TelegramScraper):
     def prepare_message_dict(self, message):
         return prepare_message_dict_template(self.exchange, message)
 
-    def read_message(self, message_dict):
+    async def read_message(self, message_dict):
         if message_dict is None:
             return None
 
@@ -562,6 +533,43 @@ class GateioScraper(TelegramScraper):
         if "DELIST" in msg:
             message_dict = self.get_blacklisted_coins(message_dict)
 
+        return message_dict
+
+    def get_blacklisted_coins(self, message_dict: {}):
+        # Extract words inside parentheses
+        matches = re.findall(r'\(([^)]+)\)', message_dict['message'].upper())
+        set_title_no_trailing_slash = [match.split('/')[0] for match in matches]
+
+        # prepare variables
+        all_coins = {pair['id'].upper().replace("-", "") for pair in self.pairs.values()}
+        all_coins.update({pair['base'].upper() for pair in self.pairs.values()})
+
+        # Use list comprehension to build the set of coins directly
+        set_coins = {coin for coin in set_title_no_trailing_slash if coin.upper() in all_coins}
+
+        caught_coins = set(message_dict['blacklisted_pairs'])
+        for set_coin in set_coins:
+            # Add the coin itself without any prefix or suffix
+            pattern_coin_itself = f"{set_coin}/.*"
+            caught_coins.add(pattern_coin_itself)
+
+            # Check all combinations of prefixes and suffixes
+            for prefix in self.coin_prefixes:
+                for suffix in self.coin_suffixes:
+                    # Construct potential coin combinations
+                    potential_coin_combo = f"{prefix}{set_coin}{suffix}".upper()
+                    potential_coin_prefix = f"{prefix}{set_coin}".upper()
+                    potential_coin_suffix = f"{set_coin}{suffix}".upper()
+
+                    # Check if any of these patterns match 'base' values in self.pairs
+                    for pair_key, pair_value in self.pairs.items():
+                        if 'base' in pair_value:
+                            base_value = pair_value['base'].upper()
+                            if (fnmatch.fnmatch(base_value, potential_coin_combo) or
+                                    fnmatch.fnmatch(base_value, potential_coin_prefix) or
+                                    fnmatch.fnmatch(base_value, potential_coin_suffix)):
+                                caught_coins.add(base_value)
+        message_dict['blacklisted_pairs'] = list(caught_coins)
         return message_dict
 
 
@@ -576,7 +584,7 @@ class HtxScraper(TelegramScraper):
     def prepare_message_dict(self, message):
         return prepare_message_dict_template(self.exchange, message)
 
-    def read_message(self, message_dict):
+    async def read_message(self, message_dict):
         if message_dict is None:
             return None
 
@@ -827,25 +835,31 @@ def refresh_ccxt_exchange_pairs(exchanges_pairs):
             exchanges_pairs[exchange] = future.result()
 
 
-def handle_exception(ex1):
+async def handle_exception(ex1):
     #try:
-    StatVars.driver.quit()
+    if StatVars.context:
+        StatVars.context.close()
+    if StatVars.browser:
+        StatVars.browser.close()
+    if StatVars.playwright:
+        StatVars.playwright.stop()
     #except Exception as ex3:
-    #    logging.error(f"an error occurred: {ex3}")
+    #    logging.error(f"an error occurred during cleanup: {ex3}")
+
     #try:
-    # StatVars.driver = set_driver()
-    #    pass
+    StatVars.page = await set_playwright()
     #except Exception as ex2:
-    #    logging.error(f"an error occurred: {ex2}")
-    #logging.error(f"An error occurred: {ex1}")
-    time.sleep(30)  # an error happened, could be anything ... even being rate limited ... Take a nap bot!
+    #    logging.error(f"an error occurred during playwright setup: {ex2}")
+
+    logging.error(f"An error occurred: {ex1}")
+    time.sleep(30)
 
 
-def main():
+async def main():
     os.nice(15)
     open_processed()
     load_bots_data()
-    init_telethon()
+    await init_telethon()
 
     exchanges_to_loop_through = get_exchanges_from_bot_groups()
     check_all_bots()
@@ -863,39 +877,46 @@ def main():
     }
     exchanges_pairs = {exchange: {} for exchange in exchanges}  # Initialize as empty dictionaries
 
+    # Initial refresh at startup
+    StatVars.page = await set_playwright()
+    heartbeat_time_pairs = datetime.now()
+
+    # Optional: delay startup if it's right on a 5-minute boundary
+    if heartbeat_time_pairs.minute % 5 == 0:
+        logging.info("Startup time is divisible by 5 minutes, sleeping for 60s to avoid query weight issues...")
+        await asyncio.sleep(60)
+    await asyncio.to_thread(refresh_ccxt_exchange_pairs, exchanges_pairs)
+
     while True:
-        try:
-            StatVars.blacklist_changed = False
+        StatVars.blacklist_changed = False
+        now = datetime.now()
 
-            # Only rescan if the minute is not modulo 5 == 0
-            # This is done to avoid any potential conflicts with query weights for any timeframe >=5m
-            if datetime.now() - heartbeat_time_pairs >= timedelta(hours=24) and datetime.now().minute % 5 > 0:
-                refresh_ccxt_exchange_pairs(exchanges_pairs)
-                heartbeat_time_pairs = datetime.now()
+        # 24h heartbeat, avoid refreshing on /5-minute mark
+        if now - heartbeat_time_pairs >= timedelta(hours=24):
+            if now.minute % 5 != 0:
+                await asyncio.to_thread(refresh_ccxt_exchange_pairs, exchanges_pairs)
+                heartbeat_time_pairs = now
 
-            # Even if the previous condition triggered, still run through it on startup
-            elif all(not exchange_pairs for exchange_pairs in exchanges_pairs.values()):
-                logging.info(f"waiting 1 minute, start time is at {datetime.now().minute} % 5 == 0 "
-                             f"(to avoid potential issues with query weights)")
-                time.sleep(60)
-                refresh_ccxt_exchange_pairs(exchanges_pairs)
-                heartbeat_time_pairs = datetime.now()
-                StatVars.driver.quit()
-                StatVars.driver = set_driver()
+                StatVars.driver = await set_playwright()
+            else:
+                logging.info("24h refresh skipped to avoid 5-minute divisible minute. Will retry next iteration.")
 
-            start_time = time.monotonic()
-        except Exception as ex1:
-            handle_exception(ex1)
+        # All exchanges empty → wait + refresh
+        if all(not exchange_pairs for exchange_pairs in exchanges_pairs.values()):
+            logging.info(f"All pairs empty. Waiting 60s. Current minute: {now.minute}")
+            time.sleep(60)
+            await asyncio.to_thread(refresh_ccxt_exchange_pairs, exchanges_pairs)
+            heartbeat_time_pairs = datetime.now()
 
         if datetime.now() - heartbeat_time_pairs >= timedelta(hours=24):
             heartbeat_time_pairs = datetime.now()
-
+        #try:
         start_time = time.monotonic()
 
         # Run all scrapers sequentially
         for exchange_name, scraper in exchanges.items():
             if exchange_name.lower() in exchanges_to_loop_through:
-                scraper.scrape(exchanges_pairs[exchange_name])
+                await scraper.scrape(exchanges_pairs[exchange_name])
 
         if datetime.now() - heartbeat_time >= timedelta(minutes=15):
             logging.info("delist-scraper heartbeat")
@@ -904,7 +925,7 @@ def main():
         time_to_sleep_left = StatVars.loop_secs - ((time.monotonic() - start_time) % StatVars.loop_secs)
         logging.debug(f"for this loop we still have to wait for {time_to_sleep_left} seconds")
 
-        time.sleep(StatVars.loop_secs - ((time.monotonic() - start_time) % StatVars.loop_secs))
+        await asyncio.sleep(StatVars.loop_secs - ((time.monotonic() - start_time) % StatVars.loop_secs))
 
         #except Exception as ex:
         #    logging.error(f"An error occurred: {ex}")
@@ -914,4 +935,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
