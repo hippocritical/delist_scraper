@@ -176,7 +176,7 @@ class TelegramScraper:
     async def scrape(self, pairs):
         self.pairs = pairs
         telegram_channel = await StatVars.telethon_client.get_entity(self.channel_username)
-
+        telegram_query_count = 0
         while not self.found_processed:
             if len(StatVars.to_be_processed) > 0:
                 logging.info(
@@ -189,6 +189,7 @@ class TelegramScraper:
                 limit=self.message_limit,
                 offset_id=self.offset_id
             )
+            telegram_query_count += 1
 
             if not messages:
                 break  # Reached the beginning of the channel
@@ -223,7 +224,10 @@ class TelegramScraper:
             if new_blacklist:
                 save_blacklist(self.exchange, new_blacklist)
                 send_blacklists()
-                if len(messages) == self.message_limit:
+
+                # only send messages to the freqtrade bot if there s no historical data grabbed.
+                # Outdated info would be bad to be force enter short.
+                if telegram_query_count == 1:
                     send_force_exit_long()
                     send_force_enter_short()
 
@@ -465,6 +469,7 @@ class KucoinScraper(TelegramScraper):
                         logging.warning(f"[Attempt {attempt + 1}] Article content not found at {url}")
                 except Exception as e:
                     logging.error(f"[Attempt {attempt + 1}] Error retrieving content from {url}: {e}")
+                    time.sleep(10)
 
             if not success:
                 logging.warning(f"Failed to retrieve content from {url} after 2 attempts.")
