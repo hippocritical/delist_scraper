@@ -21,6 +21,7 @@ source .venv/bin/activate
 python3 -m pip install --upgrade pip
 REQUIREMENTS=requirements.txt
 python3 -m pip install --upgrade -r ${REQUIREMENTS}
+playwright install
 
 echo "Virtual environment setup complete. Activate it using 'source .venv/bin/activate'!"
 
