@@ -12,21 +12,27 @@ Backtesting is also facilitated as the 'processed.json' file contains pertinent 
 
 - **bot-groups.json:** This file stores details of all bots, including the exchanges to scrape, IPs, usernames, passwords, and the name of the blacklist to be used for local storage. With the provided configuration file (e.g., 'blacklist.json'), transitioning to a VPS and integrating a new blacklist configuration becomes straightforward.
 - **processed.json:** This file stores all news that were scraped.
-- **processed.json_prefilled.7z** This file is already pre-filled so the initial loop does not take for hours and does not need tons of RAM.
 
 ## Initial Loop Logic:
 
-Upon execution, the script first scrapes all news from the specified channels using a Chromium instance, which demands considerable memory resources. Once it collects all news items from an exchange, it saves the blacklist and 'processed.json', attempting to send the blacklisted pairs to all bots as specified in 'bot-groups.json'. It's advised not to perform this initial step on a low-memory VPS. Instead, it's recommended to conduct it locally and then transfer the JSON file to the VPS if necessary. Alternatively, ample swap space (e.g., 10GB) can facilitate scraping, especially for exchanges like KuCoin.
-
-**You can run this program on a weaker VPS or a Raspberry Pi with limited memory,** provided the initial data gathering is done on a more powerful machine. The initial run involves opening a browser window with approximately 20k messages, consuming over 8GB of memory. Subsequent runs are less resource-intensive.
+Upon execution, the script first scrapes all news from the specified channels using telethon (a telegram api program).
+Once it collects all news items from an exchange, it saves the blacklist and 'processed.json', 
+attempting to send the blacklisted pairs to all bots as specified in 'bot-groups.json'.
+By switching from browser to telethon you don't need anything powerful anymore cpu wise.
 
 ## Logic After Initial Loop:
 
-After completing the initial loop, the program continues to monitor for fresh news. When new delisting announcements are detected, the affected pairs are added to the blacklist as defined in 'bot-groups.json'. Additionally, if the 'signal force_enter_new_blacklisted_pairs' parameter is set to true, the program sends force-short-entry and force-long-exit signals to the relevant bots.
+After completing the initial loop, the program continues to monitor for fresh news.
+When new delisting announcements are detected, the affected pairs are added to the blacklist as defined in 'bot-groups.json'.
+Additionally, if the 'signal force_enter_new_blacklisted_pairs' parameter is set to true,
+the program sends force-short-entry and force-long-exit signals to the relevant bots.
 
 ## Reasoning Behind This Tool:
 
-The tool addresses situations where announcements from major exchanges, such as Binance, regarding delisted pairs (especially significant pairs like XMR), can cause market turbulence across other exchanges. By promptly blacklisting affected pairs, it aims to mitigate adverse market impacts and potentially capitalize on shorting opportunities.
+The tool addresses situations where announcements from major exchanges, such as Binance,
+regarding delisted pairs (especially significant pairs like XMR), can cause market turbulence across other exchanges.
+By promptly blacklisting affected pairs, it aims to mitigate adverse market impacts and potentially capitalize 
+on shorting opportunities.
 
 ## Backtesting with the Supplied Strategy:
 
@@ -35,20 +41,13 @@ and migrate those pairs into a whitelist.
 Additionally, modify the strategy to incorporate JSON data into the dataframe.
 Note that the provided strategy is illustrative and requires adjustments based on actual trading preferences.
 
-## Considerations if you want to run it on a weak VPS
-The initial setup takes a lot of memory. It is advised to do the initial round on your home PC with at least 8GB RAM and SWAP.
-After the initial run you can easily run the scraper on a 1GB VPS with a weak CPU.
-
-## Note on using ARM processors
-Geckodriver only supports 64bit arm processors via precompiled releases out of the box.
-
 ## Setup Process:
 
 1. Define your bots in 'bot-groups.json,' specifying the exchanges for which blacklisted pairs should be sent.
 2. Copy 'bot-groups.json.example' to 'bot-groups.json.'
 3. Modify 'bot-groups.json' with your bot information.
 4. Optionally, pre-fill your blacklist in 'bot-groups.json', or let the tool create it automatically upon saving.
-5. Adjust the 'loop_secs' parameter to suit your scraping frequency preference (default is 10 seconds).
+5. Adjust the 'loop_secs' parameter to suit your scraping frequency preference.
 
 
 ## Setup process:
@@ -58,16 +57,18 @@ cp bot-groups.json.example bot-groups.json
 cp processed.json.example processed.json
 cp global_blacklist.json.example global_blacklist.json
 nano bot-groups.json
+cp telegram_config.json.example telegram_config.json.example
 ```
 
 * Modify bot-groups.json with the info of your bots
   * Optionally you can create and pre-fill your blacklist defined in bot-groups.json. Alternatively it will create that file you defined in bot-groups.json automatically upon saving the blacklist.
-* Modify `loop_secs` to suit your preference of how often the bot scrape all exchanges. Default is 10 seconds.
+* Modify telegram_config.json
+  * Go on the website https://my.telegram.org and log in.
+    * Click on "API Development Tools", fill out the form, then transfer your api_id and api_hash to the file. 
 
 ## Non-docker
 ```
 bash install.sh
-bash install_firefox.sh
 source .venv/bin/activate
 bash run.sh
 ```

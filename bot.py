@@ -74,6 +74,11 @@ class StatVars:
     context = None
     page = None
 
+    # was added to be able to fire an exit event multiple times for multiple exchanges
+    # and to not fire the same pair multiple times
+    # if the exchange mentions the delisting multiple times, among other things.
+    blacklists_exchanges = {}
+
 
 async def set_playwright():
     logging.info("Starting Playwright browser")
@@ -89,7 +94,7 @@ async def set_playwright():
 
     # Start new instance
     StatVars.playwright_instance = await async_playwright().start()
-    browser = await StatVars.playwright_instance.firefox.launch(headless=True)
+    browser = await StatVars.playwright_instance.chromium.launch(headless=True)
     context = await browser.new_context(
         accept_downloads=False,
         ignore_https_errors=True,
@@ -159,6 +164,7 @@ def set_unique_identifiers():
 
 class TelegramScraper:
     def __init__(self):
+        self.blacklist_exchange_config = None
         self.exchange = ""
         self.channel_username = ""
         self.coin_prefixes = []
@@ -174,6 +180,7 @@ class TelegramScraper:
         self.pairs = {}
 
     async def scrape(self, pairs):
+        self.blacklist_exchange_config = StatVars.blacklists_exchanges[self.exchange]
         self.pairs = pairs
         telegram_channel = await StatVars.telethon_client.get_entity(self.channel_username)
         telegram_query_count = 0
@@ -222,7 +229,7 @@ class TelegramScraper:
                     new_blacklist.extend(message_dict["blacklisted_pairs"])
 
             if new_blacklist:
-                save_blacklist(self.exchange, new_blacklist)
+                save_blacklists(self.exchange, new_blacklist)
                 send_blacklists()
 
                 # only send messages to the freqtrade bot if there s no historical data grabbed.
@@ -282,6 +289,9 @@ class TelegramScraper:
     # This was changed to specifically looking for prefixes since a pair W and T was blacklisted, which would
     # blacklist all pairs ending on a T or W which ... sucks
     def get_blacklisted_coins(self, message_dict: {}):
+        exchange_blacklist_config_content = (self.blacklist_exchange_config
+        ['file_content']['exchange']['pair_blacklist'])
+
         modified_message = (message_dict['message'].upper()
                             .replace("and".upper(), " ")
                             .replace("&".upper(), " ")
@@ -312,24 +322,28 @@ class TelegramScraper:
         for set_coin in set_coins:
             # Add the coin itself without any prefix or suffix
             pattern_coin_itself = f"{set_coin}/.*"
-            caught_coins.add(pattern_coin_itself)
 
-            # Check all combinations of prefixes and suffixes
-            for prefix in self.coin_prefixes:
-                for suffix in self.coin_suffixes:
-                    # Construct potential coin combinations
-                    potential_coin_combo = f"{prefix}{set_coin}{suffix}".upper()
-                    potential_coin_prefix = f"{prefix}{set_coin}".upper()
-                    potential_coin_suffix = f"{set_coin}{suffix}".upper()
+            # only add it if the coin has never been caught for this exchange before
+            if pattern_coin_itself not in exchange_blacklist_config_content:
+                caught_coins.add(pattern_coin_itself)
+                exchange_blacklist_config_content.append(pattern_coin_itself)
 
-                    # Check if any of these patterns match 'base' values in self.pairs
-                    for pair_key, pair_value in self.pairs.items():
-                        if 'base' in pair_value:
-                            base_value = pair_value['base'].upper()
-                            if (fnmatch.fnmatch(base_value, potential_coin_combo) or
-                                    fnmatch.fnmatch(base_value, potential_coin_prefix) or
-                                    fnmatch.fnmatch(base_value, potential_coin_suffix)):
-                                caught_coins.add(base_value)
+                # Check all combinations of prefixes and suffixes
+                for prefix in self.coin_prefixes:
+                    for suffix in self.coin_suffixes:
+                        # Construct potential coin combinations
+                        potential_coin_combo = f"{prefix}{set_coin}{suffix}".upper()
+                        potential_coin_prefix = f"{prefix}{set_coin}".upper()
+                        potential_coin_suffix = f"{set_coin}{suffix}".upper()
+
+                        # Check if any of these patterns match 'base' values in self.pairs
+                        for pair_key, pair_value in self.pairs.items():
+                            if 'base' in pair_value:
+                                base_value = pair_value['base'].upper()
+                                if (fnmatch.fnmatch(base_value, potential_coin_combo) or
+                                        fnmatch.fnmatch(base_value, potential_coin_prefix) or
+                                        fnmatch.fnmatch(base_value, potential_coin_suffix)):
+                                    caught_coins.add(base_value)
         message_dict['blacklisted_pairs'] = list(caught_coins)
         return message_dict
 
@@ -469,7 +483,7 @@ class KucoinScraper(TelegramScraper):
                         logging.warning(f"[Attempt {attempt + 1}] Article content not found at {url}")
                 except Exception as e:
                     logging.error(f"[Attempt {attempt + 1}] Error retrieving content from {url}: {e}")
-                    time.sleep(10)
+                    time.sleep(1)
 
             if not success:
                 logging.warning(f"Failed to retrieve content from {url} after 2 attempts.")
@@ -552,6 +566,9 @@ class GateioScraper(TelegramScraper):
         return message_dict
 
     def get_blacklisted_coins(self, message_dict: {}):
+        exchange_blacklist_config_content = (self.blacklist_exchange_config
+        ['file_content']['exchange']['pair_blacklist'])
+
         # Extract words inside parentheses
         matches = re.findall(r'\(([^)]+)\)', message_dict['message'].upper())
         set_title_no_trailing_slash = [match.split('/')[0] for match in matches]
@@ -567,24 +584,28 @@ class GateioScraper(TelegramScraper):
         for set_coin in set_coins:
             # Add the coin itself without any prefix or suffix
             pattern_coin_itself = f"{set_coin}/.*"
-            caught_coins.add(pattern_coin_itself)
 
-            # Check all combinations of prefixes and suffixes
-            for prefix in self.coin_prefixes:
-                for suffix in self.coin_suffixes:
-                    # Construct potential coin combinations
-                    potential_coin_combo = f"{prefix}{set_coin}{suffix}".upper()
-                    potential_coin_prefix = f"{prefix}{set_coin}".upper()
-                    potential_coin_suffix = f"{set_coin}{suffix}".upper()
+            # only add it if the coin has never been caught for this exchange before
+            if pattern_coin_itself not in exchange_blacklist_config_content:
+                caught_coins.add(pattern_coin_itself)
+                exchange_blacklist_config_content.append(pattern_coin_itself)
 
-                    # Check if any of these patterns match 'base' values in self.pairs
-                    for pair_key, pair_value in self.pairs.items():
-                        if 'base' in pair_value:
-                            base_value = pair_value['base'].upper()
-                            if (fnmatch.fnmatch(base_value, potential_coin_combo) or
-                                    fnmatch.fnmatch(base_value, potential_coin_prefix) or
-                                    fnmatch.fnmatch(base_value, potential_coin_suffix)):
-                                caught_coins.add(base_value)
+                # Check all combinations of prefixes and suffixes
+                for prefix in self.coin_prefixes:
+                    for suffix in self.coin_suffixes:
+                        # Construct potential coin combinations
+                        potential_coin_combo = f"{prefix}{set_coin}{suffix}".upper()
+                        potential_coin_prefix = f"{prefix}{set_coin}".upper()
+                        potential_coin_suffix = f"{set_coin}{suffix}".upper()
+
+                        # Check if any of these patterns match 'base' values in self.pairs
+                        for pair_key, pair_value in self.pairs.items():
+                            if 'base' in pair_value:
+                                base_value = pair_value['base'].upper()
+                                if (fnmatch.fnmatch(base_value, potential_coin_combo) or
+                                        fnmatch.fnmatch(base_value, potential_coin_prefix) or
+                                        fnmatch.fnmatch(base_value, potential_coin_suffix)):
+                                    caught_coins.add(base_value)
         message_dict['blacklisted_pairs'] = list(caught_coins)
         return message_dict
 
@@ -614,9 +635,10 @@ class HtxScraper(TelegramScraper):
         return message_dict
 
 
-def save_blacklist(exchange: str, new_blacklisted_pairs: []):
+def save_blacklists(exchange: str, new_blacklisted_pairs: []):
     for bot_group in StatVars.bot_groups:
         if exchange in bot_group['exchanges']:
+            # first we save the overall file
             file_name = bot_group['config_path']
             if os.path.exists(file_name):
                 # Read existing data from file
@@ -639,6 +661,10 @@ def save_blacklist(exchange: str, new_blacklisted_pairs: []):
             # Save modified data back to the file
             with open(file_name, 'w') as json_file:
                 rapidjson.dump(data, json_file, indent=4)
+
+            # Then we save the exchange-specific blacklist (to avoid doubly adding the same pairs)
+            with open(StatVars.blacklists_exchanges[exchange]['file_path'], 'w', encoding='utf-8') as f:
+                rapidjson.dump(StatVars.blacklists_exchanges[exchange]['file_content'], f, indent=4)
 
 
 # Shared prepare_message_dict to reuse across all classes
@@ -674,6 +700,11 @@ def open_processed():
     StatVars.logger.info("Loading local processed file")
     #try:
     set_unique_identifiers()
+
+    # create new processed file
+    if not os.path.isfile(StatVars.path_processed_file):
+        create_processed_file(StatVars.path_processed_file)
+
     # Read config from stdin if requested in the options
     with Path(StatVars.path_processed_file).open() if StatVars.path_processed_file != '-' else sys.stdin as file:
         StatVars.has_been_processed = rapidjson.load(file, parse_mode=StatVars.CONFIG_PARSE_MODE)
@@ -716,6 +747,9 @@ def load_blacklist(config_file):
 
 
 def load_bots_data():
+    if not os.path.isfile(StatVars.path_bots_file):
+        create_new_config(StatVars.path_bots_file)
+
     with Path(StatVars.path_bots_file).open() if StatVars.path_bots_file != '-' else sys.stdin as file:
         bot_groups = rapidjson.load(file, parse_mode=StatVars.CONFIG_PARSE_MODE)
         for bot_group in bot_groups:
@@ -725,6 +759,9 @@ def load_bots_data():
 
 
 def add_backtest_json_file_info(bot_group):
+    if not os.path.isfile(bot_group['config_path']):
+        create_new_config(bot_group['config_path'])
+
     # Read the JSON file located at line['config_path']
     with open(bot_group['config_path'], 'r') as config_file:
         config_data = rapidjson.load(config_file)
@@ -871,6 +908,35 @@ async def handle_exception(ex1):
     time.sleep(30)
 
 
+def create_new_config(config_path: str):
+    config = {
+        "exchange": {
+            "pair_blacklist": []
+        }
+    }
+    with open(config_path, "w") as f:
+        rapidjson.dump(config, f, indent=4)
+
+
+def create_processed_file(config_path: str):
+    with open(config_path, "w") as f:
+        rapidjson.dump([], f, indent=4)
+
+
+def load_data_of_blacklists_exchanges():
+    for exchange_name, data in StatVars.blacklists_exchanges.items():
+        path = data["file_path"]
+        if os.path.exists(path):
+            with open(path, "r") as f:
+                data["file_content"] = rapidjson.load(f)
+        else:
+            data["file_content"] = {
+                "exchange": {
+                    "pair_blacklist": []
+                }
+            }
+
+
 async def main():
     os.nice(15)
     open_processed()
@@ -892,6 +958,14 @@ async def main():
         'htx': HtxScraper()
     }
     exchanges_pairs = {exchange: {} for exchange in exchanges}  # Initialize as empty dictionaries
+    StatVars.blacklists_exchanges = {
+        exchange_name: {
+            "file_path": f"./config_{exchange_name}.json",
+            "file_content": None
+        }
+        for exchange_name in exchanges
+    }
+    load_data_of_blacklists_exchanges()
 
     # Initial refresh at startup
     await set_playwright()

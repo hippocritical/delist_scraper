@@ -10,7 +10,7 @@ fi
 
 # Update the repository and install necessary packages
 $SUDO apt-get update && $SUDO apt-get upgrade -y
-$SUDO apt-get install -y python3-venv curl software-properties-common apt-transport-https ca-certificates gnupg2 jq
+$SUDO apt-get install -y python3-venv
 
 # Create a virtual environment and activate it
 rm -rf .venv
@@ -21,7 +21,7 @@ source .venv/bin/activate
 python3 -m pip install --upgrade pip
 REQUIREMENTS=requirements.txt
 python3 -m pip install --upgrade -r ${REQUIREMENTS}
-playwright install
+playwright install chromium
 
 echo "Virtual environment setup complete. Activate it using 'source .venv/bin/activate'!"
 
